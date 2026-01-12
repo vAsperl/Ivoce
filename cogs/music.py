@@ -1,15 +1,11 @@
+import asyncio
+import logging
+import os
+import random
+import time
+
 import discord
 from discord.ext import commands
-import yt_dlp
-import os
-import asyncio
-import shutil
-import logging
-import sys
-import time
-import glob
-import json
-import random
 from collections import deque
 from datetime import datetime, timezone
 from dataclasses import dataclass
@@ -19,6 +15,8 @@ try:
     import pomice
 except ModuleNotFoundError:  # pragma: no cover - optional dependency
     pomice = None
+
+from cogs.games import CurrencyManager
 
 
 @dataclass
@@ -156,10 +154,25 @@ class TransportControls(discord.ui.View):
         next_mode = self.LOOP_ORDER[(idx + 1) % len(self.LOOP_ORDER)]
         self.state.loop_mode = next_mode
         button.label = self.LOOP_LABELS[next_mode]
+        embed_kwargs = {"view": self}
+        entry = self.state.current_entry
+        if entry:
+            embed = self.music_cog._build_now_playing_embed(entry, len(self.state.queue), self.state.loop_mode)
+            embed_kwargs["embed"] = embed
+        edit_success = False
+        now = time.time()
         try:
-            await interaction.response.edit_message(view=self)
+            await interaction.response.edit_message(**embed_kwargs)
+            edit_success = True
         except discord.HTTPException:
-            pass
+            if interaction.message:
+                try:
+                    await interaction.message.edit(**embed_kwargs)
+                    edit_success = True
+                except discord.HTTPException:
+                    pass
+        if edit_success and entry:
+            entry['last_embed_edit'] = now
         await self._reply(interaction, f"Loop mode set to {next_mode}.")
 
     @discord.ui.button(label="🔀 Shuffle", style=discord.ButtonStyle.secondary)
@@ -183,11 +196,24 @@ class GuildPlaybackState:
         self.lock = asyncio.Lock()
         self.is_playing = False
         self.current_entry = None
-        self.current_song = None
         self.loop_mode = "off"
         self.idle_disconnect_task = None
         self.empty_voice_task = None
         self.manual_disconnect = False
+
+
+def _env_int(name, default):
+    try:
+        return int(os.getenv(name, default))
+    except (TypeError, ValueError):
+        return default
+
+
+def _env_flag(name, default=False):
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
 class Music(commands.Cog):
@@ -197,29 +223,20 @@ class Music(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
         self.logger = logging.getLogger('discord.music')
-        self.ffmpeg_path = os.getenv('FFMPEG_PATH')
         self.guild_states = {}
-        self._orphaned_downloads = []
-        self._leftover_consumed = False
-        self.download_root = os.getenv('DOWNLOAD_ROOT', 'downloads')
-        os.makedirs(self.download_root, exist_ok=True)
-        self._scan_orphan_files()
         self.pomice_pool = pomice.NodePool() if pomice else None
         self.pomice_nodes = self._load_pomice_node_specs()
         self._pomice_nodes_ready = False
         self._pomice_nodes_started = False
         self.pomice_player_cls = pomice.Player if pomice else None
-        self.pomice_only = os.getenv("POMICE_ONLY", "0").lower() in ("1", "true", "yes")
-
-    def _ffmpeg_executable_name(self):
-        return 'ffmpeg.exe' if sys.platform.startswith('win') else 'ffmpeg'
-
-    def _resolve_ffmpeg_path(self):
-        if not self.ffmpeg_path:
-            return None
-        if os.path.isdir(self.ffmpeg_path):
-            return os.path.join(self.ffmpeg_path, self._ffmpeg_executable_name())
-        return self.ffmpeg_path
+        self.play_reward = _env_int("MUSIC_PLAY_REWARD", 10)
+        self.play_reward_min_duration = _env_int("MUSIC_REWARD_MIN_SECONDS", 60)
+        self.play_reward_repeat_limit = _env_int("MUSIC_REWARD_REPEAT_LIMIT", 3)
+        self.play_reward_streaks = {}
+        self.play_reward_batch_size = _env_int("MUSIC_REWARD_BATCH_SIZE", 5)
+        self.play_reward_batch_amount = _env_int("MUSIC_REWARD_BATCH_AMOUNT", 50)
+        self.play_reward_counts = {}
+        self.disable_loop_rewards = _env_flag("DISABLE_LOOP_REWARDS", default=False)
 
     def _load_pomice_node_specs(self):
         raw = os.getenv("POMICE_NODES", "").strip()
@@ -366,16 +383,9 @@ class Music(commands.Cog):
             current_entry = state.current_entry
             state.current_entry = None
             state.is_playing = False
-            current_song = state.current_song
-            state.current_song = None
         if current_entry:
             current_entry['stopped_due_to_empty_vc'] = True
             self._cancel_now_playing_timestamp_updates(current_entry)
-            self._cleanup_song_file(current_entry.get('song_filename'))
-            self._cleanup_song_file(current_entry.get('prefetched_filename'))
-        for entry in pending_entries:
-            self._cleanup_song_file(entry.get('song_filename'))
-            self._cleanup_song_file(entry.get('prefetched_filename'))
         voice_client = guild.voice_client
         if voice_client:
             if self._vc_is_playing(voice_client):
@@ -430,141 +440,6 @@ class Music(commands.Cog):
             return f"{hours}:{minutes:02d}:{secs:02d}"
         return f"{minutes}:{secs:02d}"
 
-    def _yt_dlp_options(self, progress_hook=None):
-        resolved = self._resolve_ffmpeg_path()
-        opts = {
-            'format': 'bestaudio/best',
-            'outtmpl': os.path.join(self.download_root, '%(title)s.%(ext)s'),
-            'ffmpeg_location': resolved or 'ffmpeg',
-        }
-        if progress_hook:
-            opts['progress_hooks'] = [progress_hook]
-        return opts
-
-    def is_ffmpeg_installed(self):
-        resolved = self._resolve_ffmpeg_path()
-        if resolved and os.path.isfile(resolved) and os.access(resolved, os.R_OK):
-            return True
-        return shutil.which("ffmpeg") is not None
-
-    async def download_song(self, url, info=None):
-        self.logger.info(f"Downloading song from {url}")
-        ydl_opts = self._yt_dlp_options()
-
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            if info is None:
-                info = await asyncio.to_thread(ydl.extract_info, url, download=False)
-            song_filename = ydl.prepare_filename(info)
-            if not os.path.exists(song_filename):
-                self.logger.info(f"{song_filename} not found, downloading...")
-                await asyncio.to_thread(ydl.download, [url])
-            else:
-                self.logger.info(f"Found existing file: {song_filename}")
-
-        self._save_metadata_for_song(song_filename, info)
-        self.logger.info(f"Finished download: {song_filename}")
-        return song_filename, info['title']
-
-    def _save_metadata_for_song(self, song_filename, info):
-        payload = {
-            'audio_filename': os.path.abspath(song_filename),
-            'metadata': {
-                'id': info.get('id') if info else None,
-                'url': info.get('url') if info else None,
-                'webpage_url': info.get('webpage_url') if info else None,
-                'title': info.get('title') if info else None,
-                'thumbnail': info.get('thumbnail') if info else None,
-                'duration': info.get('duration') if info else None,
-                'uploader': info.get('uploader') if info else None,
-            },
-        }
-        meta_path = self._metadata_file_for(song_filename)
-        try:
-            with open(meta_path, 'w', encoding='utf-8') as fh:
-                json.dump(payload, fh, ensure_ascii=False)
-        except OSError as exc:
-            self.logger.warning(f"Failed to write metadata for {song_filename}: {exc}")
-
-    def _cleanup_song_file(self, path):
-        if not path:
-            return
-        if os.path.exists(path):
-            try:
-                os.remove(path)
-            except OSError as exc:
-                self.logger.warning(f"Failed to remove {path}: {exc}")
-        meta = self._metadata_file_for(path)
-        if os.path.exists(meta):
-            try:
-                os.remove(meta)
-            except OSError:
-                pass
-
-    def _metadata_file_for(self, path):
-        return f"{os.path.abspath(path)}.meta.json"
-
-    def _scan_orphan_files(self):
-        pattern = os.path.join(self.download_root, "**", "*.meta.json")
-        for meta_path in glob.glob(pattern, recursive=True):
-            try:
-                with open(meta_path, 'r', encoding='utf-8') as fh:
-                    payload = json.load(fh)
-                audio = payload.get('audio_filename')
-                metadata = payload.get('metadata')
-                if not audio or not os.path.exists(audio):
-                    os.remove(meta_path)
-                    continue
-                self._orphaned_downloads.append({
-                    'audio': audio,
-                    'metadata': metadata,
-                    'meta_path': meta_path,
-                })
-            except Exception as exc:
-                self.logger.warning(f"Unable to read orphan metadata {meta_path}: {exc}")
-                try:
-                    os.remove(meta_path)
-                except OSError:
-                    pass
-
-    def _match_orphan(self, metadata):
-        if not metadata:
-            return None
-        target_id = metadata.get('id')
-        target_url = metadata.get('webpage_url') or metadata.get('url')
-        for entry in self._orphaned_downloads:
-            existing = entry.get('metadata') or {}
-            existing_id = existing.get('id')
-            existing_url = existing.get('webpage_url') or existing.get('url')
-            if target_id and existing_id and target_id == existing_id:
-                return entry
-            if target_url and existing_url and target_url == existing_url:
-                return entry
-        return None
-
-    def _delete_orphan_files(self, exclude_audio=None):
-        remaining = []
-        for entry in self._orphaned_downloads:
-            audio = entry['audio']
-            if exclude_audio and os.path.abspath(audio) == os.path.abspath(exclude_audio):
-                remaining.append(entry)
-                continue
-            self._cleanup_song_file(audio)
-        self._orphaned_downloads = remaining
-
-    def _consume_leftover(self, metadata):
-        if self._leftover_consumed:
-            return None
-        self._leftover_consumed = True
-        if not self._orphaned_downloads:
-            return None
-        candidate = self._match_orphan(metadata)
-        if candidate:
-            self._orphaned_downloads.remove(candidate)
-            self._delete_orphan_files(exclude_audio=candidate['audio'])
-            return candidate
-        self._delete_orphan_files()
-        return None
-
     async def _safe_delete_message(self, message):
         if not message:
             return
@@ -611,53 +486,6 @@ class Music(commands.Cog):
         )
         embed.set_footer(text=footer or "Music player")
         return embed
-
-    async def _ensure_next_prefetch(self, state):
-        if self.pomice_only or self._should_use_pomice():
-            return
-        if not state:
-            return
-        async with state.lock:
-            if not state.queue:
-                return
-            next_entry = state.queue[0]
-            if next_entry.get('prefetched_filename') or next_entry.get('is_prefetching'):
-                return
-            next_entry['is_prefetching'] = True
-        asyncio.create_task(self._prefetch_entry(state, next_entry))
-
-    async def _prefetch_entry(self, state, entry):
-        if self.pomice_only or self._should_use_pomice():
-            return
-        song_filename = None
-        song_title = None
-        try:
-            song_filename, song_title = await self.download_song(
-                entry['url'],
-                info=entry.get('metadata'),
-            )
-        except Exception as exc:
-            self.logger.error(f"Prefetch failed for {entry['url']}: {exc}", exc_info=True)
-        finally:
-            async with state.lock:
-                entry.pop('is_prefetching', None)
-                if entry not in state.queue:
-                    if song_filename:
-                        self._cleanup_song_file(song_filename)
-                    return
-                if song_filename:
-                    entry['prefetched_filename'] = song_filename
-                if song_title and not entry.get('title'):
-                    entry['title'] = song_title
-
-    async def _fetch_song_info(self, url):
-        try:
-            ydl_opts = self._yt_dlp_options()
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                return await asyncio.to_thread(ydl.extract_info, url, download=False)
-        except Exception as exc:
-            self.logger.warning(f"Failed to retrieve metadata for {url}: {exc}", exc_info=True)
-            return None
 
     def _get_elapsed_time(self, entry):
         start_time = entry.get('start_time')
@@ -752,7 +580,7 @@ class Music(commands.Cog):
         title = entry.get('title') or metadata.get('title') or entry.get('url') or "Unknown title"
         link = metadata.get('webpage_url') or entry.get('url')
         safe_title = discord.utils.escape_markdown(title)
-        if link:
+        if link and (link.startswith("http://") or link.startswith("https://")):
             return f"[{safe_title}]({link})"
         return safe_title
 
@@ -872,14 +700,23 @@ class Music(commands.Cog):
         embed.set_footer(text=f"Loop mode: {state.loop_mode.capitalize()}, total {len(state.queue)} tracks waiting")
         return embed
 
-    @commands.command()
+    def _build_usage_embed(self, usage, example=None):
+        description = f"Usage: {usage}"
+        embed = self._build_status_embed(
+            "Missing required input",
+            description,
+            color=discord.Color.orange(),
+            footer="Music player",
+        )
+        if example:
+            embed.add_field(name="Example", value=example, inline=False)
+        return embed
+
+    @commands.command(aliases=["p"])
     async def play(self, ctx, *, url):
         self.logger.info(f"Play command invoked by {ctx.author} in {ctx.guild.name}")
-        if not self.is_ffmpeg_installed():
-            self.logger.error("ffmpeg not found or not accessible.")
-            await ctx.send("FFmpeg is not installed, not in your PATH, or not accessible. Please check your FFMPEG_PATH in your .env file and the file permissions.")
-            if self.ffmpeg_path:
-                await ctx.send(f"The path I am checking is: {self.ffmpeg_path}")
+        if not pomice:
+            await ctx.send("Lavalink is not available. Pomice is not installed.")
             return
 
         if ctx.author.voice is None:
@@ -890,44 +727,10 @@ class Music(commands.Cog):
         voice_channel = ctx.author.voice.channel
         self.logger.info(f"User is in voice channel: {voice_channel.name}")
 
-        use_pomice = self.pomice_only or self._should_use_pomice()
-        if not use_pomice:
-            try:
-                if ctx.voice_client is None:
-                    self.logger.info(f"Not in a voice channel. Connecting to {voice_channel.name}")
-                    await voice_channel.connect()
-                else:
-                    self.logger.info(f"Already in a voice channel. Moving to {voice_channel.name}")
-                    await ctx.voice_client.move_to(voice_channel)
-            except (discord.DiscordException, asyncio.TimeoutError) as exc:
-                self.logger.error(f"Failed to join voice channel {voice_channel.name}: {exc}", exc_info=True)
-                await ctx.send("I couldn’t join your voice channel. Please try again.")
-                return
-
-            vc = ctx.voice_client
-            if vc is None or vc.channel is None:
-                self.logger.warning("Voice client disappeared while joining.")
-                await ctx.send("I couldn’t connect to that voice channel. Please try again.")
-                return
-            self.logger.info(f"Connected to {vc.channel.name}")
-
         if not url or not url.strip():
             await ctx.send("Please provide a URL to play.")
             return
         await self._safe_delete_message(ctx.message)
-        metadata = None
-        leftover = None
-        if not use_pomice:
-            metadata = await self._fetch_song_info(url)
-            if metadata is None:
-                await ctx.send("I couldn’t fetch that URL. It might not be supported.")
-                return
-            leftover = self._consume_leftover(metadata)
-            if leftover:
-                combined = {}
-                combined.update(leftover.get('metadata') or {})
-                combined.update(metadata or {})
-                metadata = combined
 
         entry = {
             'url': url,
@@ -935,20 +738,17 @@ class Music(commands.Cog):
             'guild': ctx.guild,
             'voice_channel': voice_channel,
             'text_channel': ctx.channel,
-            'title': metadata.get('title') if metadata else None,
-            'metadata': metadata,
-            'prefetched_filename': None,
-            'song_filename': None,
+            'title': None,
+            'metadata': None,
             'loading_message': None,
+            'state': None,
         }
-        if use_pomice:
-            pomice_track = await self._resolve_pomice_track(entry, ctx)
-            if pomice_track:
-                entry['pomice_track'] = pomice_track
-        if leftover:
-            entry['prefetched_filename'] = leftover['audio']
+        pomice_track = await self._resolve_pomice_track(entry, ctx)
+        if pomice_track:
+            entry['pomice_track'] = pomice_track
 
         state = self._get_state(ctx.guild)
+        entry['state'] = state
         state.manual_disconnect = False
         async with state.lock:
             queue_position = len(state.queue) + 1
@@ -956,10 +756,7 @@ class Music(commands.Cog):
             should_ack_queue = len(state.queue) > 1 or state.is_playing
 
         if not should_ack_queue:
-            if use_pomice and not entry.get('title'):
-                track_line = entry['url']
-            else:
-                track_line = self._format_queue_entry_title(entry)
+            track_line = entry['url'] if not entry.get('title') else self._format_queue_entry_title(entry)
             description = (
                 f"{track_line}\n"
                 f"Requested by {entry['requester'].display_name}"
@@ -976,7 +773,14 @@ class Music(commands.Cog):
             await ctx.send(embed=embed)
 
         await self._start_next_in_queue(state, ctx.guild)
-        await self._ensure_next_prefetch(state)
+
+    @play.error
+    async def play_error(self, ctx, error):
+        if isinstance(error, commands.MissingRequiredArgument):
+            embed = self._build_usage_embed("?play <url or search>", "?play https://example.com")
+            await ctx.send(embed=embed)
+            return
+        raise error
 
     @commands.command(name="clear")
     async def clear(self, ctx):
@@ -1002,10 +806,6 @@ class Music(commands.Cog):
                     await ctx.voice_client.stop()
                 else:
                     ctx.voice_client.stop()
-            self._cleanup_song_file(state.current_song)
-            state.current_song = None
-        for entry in pending_entries:
-            self._cleanup_song_file(entry.get('prefetched_filename'))
         embed = self._build_status_embed(
             "Queue cleared",
             "Stopped playback and cleared the queue.",
@@ -1033,16 +833,12 @@ class Music(commands.Cog):
         if ctx.voice_client:
             self.logger.info("Disconnecting from voice channel.")
             await ctx.voice_client.disconnect()
-            self._cleanup_song_file(state.current_song)
-            state.current_song = None
         else:
             self.logger.warning("Not in a voice channel.")
             await ctx.send("I am not in a voice channel.")
         current_entry = state.current_entry
         self._cancel_now_playing_timestamp_updates(current_entry)
         state.current_entry = None
-        for entry in pending_entries:
-            self._cleanup_song_file(entry.get('prefetched_filename'))
         embed = self._build_status_embed(
             "Disconnected",
             "Left voice channel and cleared the queue.",
@@ -1075,7 +871,6 @@ class Music(commands.Cog):
             queue_list = list(state.queue)
             removed = queue_list.pop(pos - 1)
             state.queue = deque(queue_list)
-        self._cleanup_song_file(removed.get('prefetched_filename'))
         title = removed.get('title') or removed.get('url')
         embed = self._build_status_embed(
             "Removed from queue",
@@ -1084,6 +879,14 @@ class Music(commands.Cog):
             footer=f"Removed position #{pos}"
         )
         await ctx.send(embed=embed)
+
+    @remove_from_queue.error
+    async def remove_from_queue_error(self, ctx, error):
+        if isinstance(error, commands.MissingRequiredArgument):
+            embed = self._build_usage_embed("?remove <position>", "?remove 2")
+            await ctx.send(embed=embed)
+            return
+        raise error
 
     @commands.command(name="np")
     async def now_playing_command(self, ctx):
@@ -1116,11 +919,7 @@ class Music(commands.Cog):
         text_channel = entry['text_channel']
 
         try:
-            if self._should_use_pomice():
-                await self._play_entry_with_pomice(entry, state, guild, voice_channel, text_channel)
-            else:
-                await self._play_entry_with_ffmpeg(entry, state, guild, voice_channel, text_channel)
-            await self._ensure_next_prefetch(state)
+            await self._play_entry_with_pomice(entry, state, guild, voice_channel, text_channel)
         except Exception as e:
             self.logger.error(f"An error occurred while handling the queue: {e}", exc_info=True)
             await self._delete_loading_message(entry)
@@ -1185,64 +984,6 @@ class Music(commands.Cog):
         title = track.title if hasattr(track, "title") else entry.get('title')
         self.logger.info(f"Sent now playing embed for {title}")
 
-    async def _play_entry_with_ffmpeg(self, entry, state, guild, voice_channel, text_channel):
-        voice_client = guild.voice_client
-        if voice_client is None:
-            self.logger.info(f"Connecting to voice channel: {voice_channel.name}")
-            voice_client = await voice_channel.connect()
-        elif voice_client.channel != voice_channel:
-            self.logger.info(f"Moving to voice channel: {voice_channel.name}")
-            await voice_client.move_to(voice_channel)
-
-        prev_song = state.current_song
-        state.current_song = None
-
-        prefetched = entry.pop('prefetched_filename', None)
-        if prefetched and not os.path.exists(prefetched):
-            prefetched = None
-        if prefetched:
-            if prev_song and os.path.abspath(prefetched) != os.path.abspath(prev_song):
-                self._cleanup_song_file(prev_song)
-            song_filename = prefetched
-            song_title = (
-                entry.get('title')
-                or entry.get('metadata', {}).get('title')
-                or os.path.splitext(os.path.basename(song_filename))[0]
-            )
-        else:
-            if prev_song:
-                self._cleanup_song_file(prev_song)
-            song_filename, song_title = await self.download_song(
-                entry['url'],
-                info=entry.get('metadata'),
-            )
-        state.current_song = song_filename
-        entry['song_filename'] = song_filename
-        entry['title'] = song_title
-        self.logger.info(f"Song download finished: {song_filename}")
-
-        executable = self._resolve_ffmpeg_path() or 'ffmpeg'
-        self.logger.info(f"Creating FFmpegPCMAudio with executable: {executable} and source: {song_filename}")
-        audio_source = discord.FFmpegPCMAudio(source=song_filename, executable=executable)
-
-        self.logger.info("Playing audio source.")
-        entry['start_time'] = time.time()
-        voice_client.play(
-            audio_source,
-            after=lambda e: asyncio.run_coroutine_threadsafe(
-                self._on_track_end(state, entry, e),
-                self.bot.loop,
-            )
-        )
-
-        await self._delete_loading_message(entry)
-        embed = self._build_now_playing_embed(entry, len(state.queue), state.loop_mode)
-        view = TransportControls(self, state)
-        view.sync_play_pause(guild.voice_client if guild else None)
-        entry['force_embed_refresh'] = bool(entry.get('now_playing_message'))
-        await self._send_now_playing_embed(text_channel, entry, state, embed, view)
-        self.logger.info(f"Sent now playing embed for {song_title}")
-
     def _apply_pomice_track_metadata(self, entry, track):
         if not track:
             return
@@ -1261,6 +1002,88 @@ class Music(commands.Cog):
             'thumbnail': thumbnail,
             'id': getattr(track, "identifier", None),
         }
+
+    def _reward_track_key(self, entry):
+        metadata = entry.get('metadata') or {}
+        key = (
+            metadata.get('id')
+            or metadata.get('webpage_url')
+            or metadata.get('url')
+            or entry.get('url')
+            or entry.get('title')
+            or ""
+        )
+        return key.strip().lower()
+
+    def _get_currency_manager(self):
+        games_cog = self.bot.get_cog("Games")
+        if games_cog and hasattr(games_cog, "currency"):
+            return games_cog.currency
+        return CurrencyManager(os.getenv("GAMES_DATAFILE", "games_currency.json"), start_balance=100)
+
+    async def _maybe_award_play_reward(self, entry, elapsed=None):
+        if self.play_reward <= 0:
+            return
+        if self.disable_loop_rewards and entry.get("state") and entry["state"].loop_mode != "off":
+            return
+        requester = entry.get('requester')
+        if not requester:
+            return
+        metadata = entry.get('metadata') or {}
+        duration = metadata.get('duration')
+        if not duration or duration < self.play_reward_min_duration:
+            return
+        if elapsed is None or elapsed + 2 < duration:
+            return
+        track_key = self._reward_track_key(entry)
+        if not track_key:
+            return
+        streak = self.play_reward_streaks.get(requester.id)
+        if streak and streak["key"] == track_key:
+            streak["count"] += 1
+        else:
+            streak = {"key": track_key, "count": 1}
+        self.play_reward_streaks[requester.id] = streak
+        if streak["count"] > self.play_reward_repeat_limit:
+            return
+        currency = self._get_currency_manager()
+        new_balance = currency.adjust(requester.id, self.play_reward)
+        if self.play_reward_batch_size > 0 and self.play_reward_batch_amount > 0:
+            new_count = self.play_reward_counts.get(requester.id, 0) + 1
+            self.play_reward_counts[requester.id] = new_count
+            if new_count % self.play_reward_batch_size == 0:
+                multiplier = new_count // self.play_reward_batch_size
+                bonus = self.play_reward_batch_amount * multiplier
+                new_balance = currency.adjust(requester.id, bonus)
+                text_channel = entry.get('text_channel')
+                if text_channel:
+                    try:
+                        embed = discord.Embed(
+                            title="Milestone Reward",
+                            description=(
+                                f"{requester.mention} hit {new_count} songs played.\n"
+                                f"Bonus: {bonus} credits."
+                            ),
+                            color=discord.Color.green(),
+                        )
+                        embed.add_field(
+                            name="Keep It Going",
+                            value=(
+                                "Finish full-length tracks to stack rewards.\n"
+                                "Loop rewards may be disabled by the server."
+                            ),
+                            inline=False,
+                        )
+                        await text_channel.send(embed=embed)
+                    except (discord.HTTPException, discord.Forbidden):
+                        pass
+        self.logger.info(
+            "Rewarded %s with %s credits for track %s (balance=%s).",
+            requester.id,
+            self.play_reward,
+            track_key,
+            new_balance,
+        )
 
     async def _resolve_pomice_track(self, entry, ctx=None):
         if not pomice or not self._should_use_pomice():
@@ -1283,31 +1106,26 @@ class Music(commands.Cog):
         if entry and entry.get('stopped_due_to_empty_vc'):
             entry.pop('stopped_due_to_empty_vc', None)
             return
+        elapsed = None
+        if entry:
+            start_time = entry.get('start_time')
+            if start_time:
+                elapsed = max(0, time.time() - start_time)
+        if entry and elapsed is not None:
+            await self._maybe_award_play_reward(entry, elapsed=elapsed)
         self._cancel_now_playing_timestamp_updates(entry)
         requeue_front = state.loop_mode == "single"
         requeue_back = state.loop_mode == "all"
         should_requeue = requeue_front or requeue_back
         reused = False
         if should_requeue:
-            if entry.get('song_filename'):
-                entry['prefetched_filename'] = entry['song_filename']
-                entry['song_filename'] = None
+            if entry.get('pomice_track') or entry.get('url'):
                 async with state.lock:
                     if requeue_front:
                         state.queue.appendleft(entry)
                     else:
                         state.queue.append(entry)
                 reused = True
-            elif entry.get('pomice_track') or entry.get('url'):
-                async with state.lock:
-                    if requeue_front:
-                        state.queue.appendleft(entry)
-                    else:
-                        state.queue.append(entry)
-                reused = True
-
-        if not reused:
-            self._cleanup_song_file(entry.get('song_filename'))
 
         async with state.lock:
             state.is_playing = False

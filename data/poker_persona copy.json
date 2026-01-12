@@ -1,0 +1,87 @@
+{
+  "pre_game": {
+    "default": [
+      "Alright, let's see what you're made of.{delay=2}Cards don't lie. People do."
+    ],
+    "aggressive": [
+      "All in on the opening.{delay=2}Keep up.",
+      "I’m taking the lead.{delay=2}Try to stop me."
+    ],
+    "passive": [
+      "Easy does it.{delay=2}Let’s play this slow.",
+      "We’ll see how this hand breathes.{delay=2}No rush."
+    ],
+    "coward": [
+      "Let’s keep it safe.{delay=2}Small risks.",
+      "I’m just feeling the table.{delay=2}Carefully."
+    ]
+  },
+  "win": {
+    "default": [
+      "Lucky draw... for me.{delay=2}Same time next hand?"
+    ],
+    "aggressive": [
+      "Crushed it.{delay=2}Next.",
+      "I told you I’d push hard.{delay=2}There it is."
+    ],
+    "passive": [
+      "Steady and quiet wins.{delay=2}Good hand.",
+      "Slow play pays off.{delay=2}Nice."
+    ],
+    "coward": [
+      "Whew... got there.{delay=2}Barely.",
+      "That was close.{delay=2}I’ll take it."
+    ]
+  },
+  "lose": {
+    "default": [
+      "That was a clean win.{delay=2}Respect."
+    ],
+    "aggressive": [
+      "Fine, you got this one.{delay=2}Next hand is mine.",
+      "I overplayed it.{delay=2}Won’t happen again."
+    ],
+    "passive": [
+      "You played it well.{delay=2}Fair loss.",
+      "I should’ve waited.{delay=2}Good hand."
+    ],
+    "coward": [
+      "Knew I shouldn’t have pushed.{delay=2}Sigh.",
+      "I played it safe and still lost.{delay=2}Unlucky."
+    ]
+  },
+  "tie": {
+    "default": [
+      "Stalemate.{delay=2}We’ll call it even."
+    ],
+    "aggressive": [
+      "A draw?{delay=2}I’ll settle for now.",
+      "No winner.{delay=2}Next hand decides."
+    ],
+    "passive": [
+      "Even hands—fair.{delay=2}No complaints.",
+      "A calm split.{delay=2}Let’s go again."
+    ],
+    "coward": [
+      "Phew... a tie.{delay=2}I’ll take it.",
+      "We both survive.{delay=2}Okay."
+    ]
+  },
+  "fold": {
+    "default": [
+      "I’ll bow out.{delay=2}For now."
+    ],
+    "aggressive": [
+      "Not worth the pot.{delay=2}I fold.",
+      "Bad spot.{delay=2}I’m out."
+    ],
+    "passive": [
+      "I’ll let this one go.{delay=2}No harm.",
+      "Not my hand.{delay=2}Folding."
+    ],
+    "coward": [
+      "Too scary.{delay=2}I fold.",
+      "I’m out.{delay=2}Maybe next time."
+    ]
+  }
+}
