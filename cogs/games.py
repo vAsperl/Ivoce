@@ -207,6 +207,8 @@ class Games(commands.Cog):
         self.currency = CurrencyManager(data_file, start_balance=100)
         self.daily_path = os.getenv("GAMES_DAILY_DATAFILE", "games_daily.json")
         self.daily_claims = self._load_daily_claims()
+        self.poker_starter_path = os.getenv("GAMES_POKER_STARTER_DATAFILE", "games_poker_starters.json")
+        self.poker_starters = self._load_poker_starters()
         self.persona_path = os.getenv("POKER_PERSONA_PATH", "data/poker_persona.json")
         self.persona_lines = self._load_persona_lines()
         self.poker_games = {}
@@ -222,6 +224,23 @@ class Games(commands.Cog):
             return data
         except (json.JSONDecodeError, OSError):
             return {}
+
+    def _load_poker_starters(self):
+        if not os.path.exists(self.poker_starter_path):
+            return {}
+        try:
+            with open(self.poker_starter_path, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+            return data if isinstance(data, dict) else {}
+        except (json.JSONDecodeError, OSError):
+            return {}
+
+    def _save_poker_starters(self):
+        try:
+            with open(self.poker_starter_path, "w", encoding="utf-8") as fh:
+                json.dump(self.poker_starters, fh)
+        except OSError:
+            pass
 
     def _pick_persona_line(self, category, *, game=None):
         lines = self.persona_lines.get(category, [])
@@ -506,12 +525,12 @@ class Games(commands.Cog):
         )
         embed.add_field(
             name="Your total bet",
-            value=f"{game['user_total_bet']} credits",
+            value=f"RM {game['user_total_bet']}",
             inline=True,
         )
         embed.add_field(
             name="Pot",
-            value=f"{game.get('pot', game['user_total_bet'])} credits",
+            value=f"RM {game.get('pot', game['user_total_bet'])}",
             inline=True,
         )
         if footer_text:
@@ -675,7 +694,7 @@ class Games(commands.Cog):
             opponent_name = self._player_display_name(game, "bot")
             if user_wins:
                 self.currency.adjust(game["user_id"], pot)
-                result_text = f"{user_name} wins {pot} credits!"
+                result_text = f"{user_name} wins RM {pot}!"
             elif user_best == bot_best:
                 split = pot // 2
                 self.currency.adjust(game["user_id"], split)
@@ -683,18 +702,18 @@ class Games(commands.Cog):
                 result_text = "It's a tie! Pot split."
             else:
                 self.currency.adjust(opponent_id, pot)
-                result_text = f"{opponent_name} wins {pot} credits!"
+                result_text = f"{opponent_name} wins RM {pot}!"
         else:
             if user_wins:
                 payout = game["user_total_bet"] * 2
                 self.currency.adjust(user_id, payout)
-                result_text = f"You win {game['user_total_bet']} credits!"
+                result_text = f"You win RM {game['user_total_bet']}!"
             elif user_best == bot_best:
                 payout = game["user_total_bet"]
                 self.currency.adjust(user_id, payout)
                 result_text = "It's a tie! Bet returned."
             else:
-                result_text = f"You lose {game['user_total_bet']} credits."
+                result_text = f"You lose RM {game['user_total_bet']}."
 
         game["bot_status"] = "Showdown."
         embed = self._poker_status_embed(game["ctx"], game, footer_text=result_text)
@@ -860,7 +879,7 @@ class Games(commands.Cog):
                 line = self._pick_persona_line("fold", game=game)
                 persona_name = game.get("bot_shadow_name")
                 persona_avatar = game.get("bot_shadow_avatar")
-                embed = self._poker_status_embed(game["ctx"], game, footer_text=f"You win {game['user_total_bet']} credits!")
+                embed = self._poker_status_embed(game["ctx"], game, footer_text=f"You win RM {game['user_total_bet']}!")
                 await self._finish_poker(interaction, game, embed)
                 await self._send_persona_message(game["ctx"], persona_name, persona_avatar, line, game=game)
                 return
@@ -875,7 +894,7 @@ class Games(commands.Cog):
                     line = self._pick_persona_line("fold", game=game)
                     persona_name = game.get("bot_shadow_name")
                     persona_avatar = game.get("bot_shadow_avatar")
-                    embed = self._poker_status_embed(game["ctx"], game, footer_text=f"You win {game['user_total_bet']} credits!")
+                    embed = self._poker_status_embed(game["ctx"], game, footer_text=f"You win RM {game['user_total_bet']}!")
                     await self._finish_poker(interaction, game, embed)
                     await self._send_persona_message(game["ctx"], persona_name, persona_avatar, line, game=game)
                     return
@@ -888,7 +907,7 @@ class Games(commands.Cog):
                 line = self._pick_persona_line("fold", game=game)
                 persona_name = game.get("bot_shadow_name")
                 persona_avatar = game.get("bot_shadow_avatar")
-                embed = self._poker_status_embed(game["ctx"], game, footer_text=f"You win {game['user_total_bet']} credits!")
+                embed = self._poker_status_embed(game["ctx"], game, footer_text=f"You win RM {game['user_total_bet']}!")
                 await self._finish_poker(interaction, game, embed)
                 await self._send_persona_message(game["ctx"], persona_name, persona_avatar, line, game=game)
                 return
@@ -964,7 +983,7 @@ class Games(commands.Cog):
                 if winner_id:
                     self.currency.adjust(winner_id, pot)
                 game["bot_status"] = f"{self._player_display_name(game, actor)} folded."
-                embed = self._poker_status_embed(game["ctx"], game, footer_text=f"{self._player_display_name(game, opponent)} wins {pot} credits!")
+                embed = self._poker_status_embed(game["ctx"], game, footer_text=f"{self._player_display_name(game, opponent)} wins RM {pot}!")
                 await self._finish_poker(interaction, game, embed)
                 return
             game["bot_status"] = "You folded."
@@ -984,7 +1003,7 @@ class Games(commands.Cog):
             min_bet = game.get("min_bet", 0)
             if min_bet and amount < min_bet:
                 await interaction.response.send_message(
-                    f"Minimum bet is {min_bet} credits.",
+                    f"Minimum bet is RM {min_bet}.",
                     ephemeral=True,
                 )
                 game["locked"] = False
@@ -995,7 +1014,7 @@ class Games(commands.Cog):
                 return
             current_balance = self._player_balance(game, actor)
             if amount > current_balance:
-                await interaction.response.send_message("You don't have enough credits for that bet.", ephemeral=True)
+                await interaction.response.send_message("You don't have enough RM for that bet.", ephemeral=True)
                 game["locked"] = False
                 return
             round_key = f"{actor}_round_bet"
@@ -1008,14 +1027,14 @@ class Games(commands.Cog):
             min_raise_to = game.get("current_bet", 0) + min_bet if min_bet else 0
             if min_bet and new_round_bet < min_raise_to:
                 await interaction.response.send_message(
-                    f"Minimum raise is {min_bet} credits.",
+                    f"Minimum raise is RM {min_bet}.",
                     ephemeral=True,
                 )
                 game["locked"] = False
                 return
             max_bet = game.get("max_bet", 0)
             if max_bet and new_round_bet > max_bet:
-                await interaction.response.send_message(f"That exceeds the max bet of {max_bet} credits.", ephemeral=True)
+                await interaction.response.send_message(f"That exceeds the max bet of RM {max_bet}.", ephemeral=True)
                 game["locked"] = False
                 return
             self._adjust_player_balance(game, actor, -amount)
@@ -1047,7 +1066,7 @@ class Games(commands.Cog):
         if effective_action in ("allin", "all-in"):
             current_balance = self._player_balance(game, actor)
             if current_balance <= 0:
-                await interaction.response.send_message("You don't have any credits to go all-in.", ephemeral=True)
+                await interaction.response.send_message("You don't have any RM to go all-in.", ephemeral=True)
                 game["locked"] = False
                 return
             round_key = f"{actor}_round_bet"
@@ -1059,7 +1078,7 @@ class Games(commands.Cog):
             amount_to_allin = target_total - current_round_bet
             if amount_to_allin <= 0:
                 await interaction.response.send_message(
-                    f"You're already at the max bet of {max_bet} credits.",
+                    f"You're already at the max bet of RM {max_bet}.",
                     ephemeral=True,
                 )
                 game["locked"] = False
@@ -1142,15 +1161,15 @@ class Games(commands.Cog):
     async def balance(self, ctx):
         bal = self.currency.get_balance(ctx.author.id)
         embed = discord.Embed(
-            title="Credit Balance",
-            description=f"{ctx.author.mention}, you have {bal} credits.",
+            title="Balance",
+            description=f"{ctx.author.mention}, you have RM {bal}.",
             color=discord.Color.green(),
         )
         embed.add_field(
             name="Tips",
             value=(
                 "• Use `?daily` for a daily reward.\n"
-                "• Play full-length songs with `?play` to earn credits.\n"
+                "• Play full-length songs with `?play` to earn RM.\n"
                 "• Avoid replaying the same song repeatedly."
             ),
             inline=False,
@@ -1176,9 +1195,9 @@ class Games(commands.Cog):
         for idx, (user_id, balance_value) in enumerate(top, start=1):
             member = ctx.guild.get_member(user_id) if ctx.guild else None
             name = member.display_name if member else f"<@{user_id}>"
-            lines.append(f"{idx}. {name} — {balance_value} credits")
+            lines.append(f"{idx}. {name} — RM {balance_value}")
         embed = discord.Embed(
-            title="Credit Leaderboard",
+            title="RM Leaderboard",
             description="\n".join(lines),
             color=discord.Color.gold(),
         )
@@ -1201,8 +1220,58 @@ class Games(commands.Cog):
         self.daily_claims[user_key] = now
         self._save_daily_claims()
         await ctx.send(
-            f"Daily claimed! You received {self.DAILY_REWARD} credits. New balance: {new_balance}."
+            f"Daily claimed! You received RM {self.DAILY_REWARD}. New balance: RM {new_balance}."
         )
+
+    @commands.command()
+    async def donate(self, ctx, *args):
+        if len(args) < 2:
+            example = "?donate 10 @user\n?donate 10 123456789012345678"
+            embed = self._build_usage_embed("?donate <amount> <@user or user_id>", example)
+            await ctx.send(embed=embed)
+            return
+        try:
+            amount = int(str(args[0]).strip())
+        except ValueError:
+            await ctx.send("Amount must be a whole number.")
+            return
+        target_arg = " ".join(str(part) for part in args[1:]).strip()
+        target = None
+        try:
+            target = await commands.MemberConverter().convert(ctx, target_arg)
+        except commands.BadArgument:
+            if target_arg.isdigit() and ctx.guild:
+                try:
+                    target = await ctx.guild.fetch_member(int(target_arg))
+                except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                    target = None
+        if not target:
+            await ctx.send("I couldn't find that user.")
+            return
+        if amount <= 0:
+            await ctx.send("Amount must be positive.")
+            return
+        if target.id == ctx.author.id:
+            await ctx.send("You can't donate to yourself.")
+            return
+        if target.bot:
+            await ctx.send("You can't donate to bots.")
+            return
+        current_balance = self.currency.get_balance(ctx.author.id)
+        if amount > current_balance:
+            await ctx.send("You don't have enough RM for that donation.")
+            return
+        new_balance = self.currency.adjust(ctx.author.id, -amount)
+        self.currency.adjust(target.id, amount)
+        embed = discord.Embed(
+            title="Donation Sent",
+            description=(
+                f"{ctx.author.display_name} sent RM {amount} to {target.display_name}.\n"
+                f"New balance: RM {new_balance}."
+            ),
+            color=discord.Color.green(),
+        )
+        await ctx.send(embed=embed)
 
     @commands.command()
     async def cheat(self, ctx, amount: int, target: discord.Member = None):
@@ -1214,31 +1283,38 @@ class Games(commands.Cog):
             return
         target = target or ctx.author
         new_balance = self.currency.adjust(target.id, amount)
-        await ctx.send(f"Cheat applied to {target.mention}. New balance: {new_balance} credits.")
+        await ctx.send(f"Cheat applied to {target.mention}. New balance: RM {new_balance}.")
 
     @commands.command()
     async def poker(self, ctx, *args):
         user_id = ctx.author.id
-        if self.currency.is_new_user(user_id):
-            starting_balance = 1000
-            self.currency.ensure_balance(user_id, starting_balance)
-            embed = discord.Embed(
-                title="Welcome to Micro Poker",
-                description=(
-                    f"{ctx.author.mention}, you’ve been credited with {starting_balance} credits to get started."
-                ),
-                color=discord.Color.blurple(),
-            )
-            embed.add_field(
-                name="Commands",
-                value=(
-                    "• `?poker <bet> [@user]` to start a hand\n"
-                    "• `?balance` or `?bal` to check credits\n"
-                    "• `?daily` for a daily reward"
-                ),
-                inline=False,
-            )
-            await ctx.send(embed=embed)
+        user_key = str(user_id)
+        starting_balance = 1000
+        if user_key not in self.poker_starters:
+            current_balance = self.currency.get_balance(user_id)
+            starter_credit = max(starting_balance - current_balance, 0)
+            if starter_credit:
+                self.currency.adjust(user_id, starter_credit)
+                embed = discord.Embed(
+                    title="Welcome to Micro Poker",
+                    description=(
+                        f"{ctx.author.mention}, you’ve been credited with RM {starter_credit} "
+                        f"to reach the RM {starting_balance} starter bankroll."
+                    ),
+                    color=discord.Color.blurple(),
+                )
+                embed.add_field(
+                    name="Commands",
+                    value=(
+                        "• `?poker <bet> [@user]` to start a hand\n"
+                        "• `?balance` or `?bal` to check RM\n"
+                        "• `?daily` for a daily reward"
+                    ),
+                    inline=False,
+                )
+                await ctx.send(embed=embed)
+            self.poker_starters[user_key] = int(time.time())
+            self._save_poker_starters()
         if not args:
             example = "?poker 10\n?poker 10 @user"
             embed = self._build_usage_embed("?poker <bet> [@user]", example)
@@ -1275,13 +1351,13 @@ class Games(commands.Cog):
                 return
             current = self.currency.get_balance(user_id)
             if current < min_bet:
-                await ctx.send(f"You need at least {min_bet} credits to cover the big blind.")
+                await ctx.send(f"You need at least RM {min_bet} to cover the big blind.")
                 return
             opponent_balance = None
             if opponent:
                 opponent_balance = self.currency.get_balance(opponent.id)
                 if opponent_balance < min_bet:
-                    await ctx.send(f"{opponent.display_name} needs at least {min_bet} credits to cover the big blind.")
+                    await ctx.send(f"{opponent.display_name} needs at least RM {min_bet} to cover the big blind.")
                     return
 
             deck = self._build_deck()
@@ -1360,8 +1436,8 @@ class Games(commands.Cog):
                 sb_name = ctx.author.mention if sb_player == "user" else shadow_name
                 bb_name = ctx.author.mention if bb_player == "user" else shadow_name
             await ctx.send(
-                f"{sb_name} posts a small blind of {sb_amount} credits.\n"
-                f"{bb_name} posts a big blind of {bb_amount} credits. Now dealing cards..."
+                f"{sb_name} posts a small blind of RM {sb_amount}.\n"
+                f"{bb_name} posts a big blind of RM {bb_amount}. Now dealing cards..."
             )
 
             game = {

@@ -1062,7 +1062,7 @@ class Music(commands.Cog):
                             title="Milestone Reward",
                             description=(
                                 f"{requester.mention} hit {new_count} songs played.\n"
-                                f"Bonus: {bonus} credits."
+                                f"Bonus: RM {bonus}."
                             ),
                             color=discord.Color.green(),
                         )
@@ -1078,7 +1078,7 @@ class Music(commands.Cog):
                     except (discord.HTTPException, discord.Forbidden):
                         pass
         self.logger.info(
-            "Rewarded %s with %s credits for track %s (balance=%s).",
+            "Rewarded %s with RM %s for track %s (balance=%s).",
             requester.id,
             self.play_reward,
             track_key,
