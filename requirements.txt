@@ -1,5 +1,4 @@
 discord.py
 python-dotenv
-yt-dlp
 PyNaCl
 pomice>=2.10.0
