@@ -138,11 +138,54 @@ class TransportControls(discord.ui.View):
         if not vc or not (self._is_playing(vc) or self._is_paused(vc)):
             await self._reply(interaction, "Nothing is playing to skip.")
             return
-        try:
-            await self._stop_voice_client(vc)
-        except Exception:
-            pass
-        await self._reply(interaction, "Skipped to the next track.")
+        state = self.state
+        entry = state.current_entry if state else None
+        if not entry:
+            await self._reply(interaction, "Nothing is playing to skip.")
+            return
+        requester = entry.get('requester')
+        listener_count = self.music_cog._voice_listener_count(vc)
+        if listener_count <= 1:
+            if requester and interaction.user.id != requester.id:
+                entry['force_reward'] = True
+            try:
+                await self._stop_voice_client(vc)
+            except Exception:
+                pass
+            if state:
+                async with state.lock:
+                    state.skip_votes.clear()
+                    state.skip_message = None
+            await self._reply(interaction, "Skipped to the next track.")
+            return
+
+        async with state.lock:
+            if interaction.user.id in state.skip_votes:
+                await self._reply(interaction, "You already voted to skip.")
+                return
+            state.skip_votes.add(interaction.user.id)
+            votes = len(state.skip_votes)
+            required = self.music_cog._skip_votes_required(listener_count)
+
+        embed = self.music_cog._build_skip_vote_embed(votes, required)
+        await self.music_cog._set_skip_vote_message(state, interaction, embed)
+
+        if votes >= required:
+            if requester and any(voter_id != requester.id for voter_id in state.skip_votes):
+                entry['force_reward'] = True
+            outcome = self.music_cog._build_skip_vote_embed(votes, required, status="passed")
+            await self.music_cog._set_skip_vote_message(state, interaction, outcome)
+            try:
+                await self._stop_voice_client(vc)
+            except Exception:
+                pass
+            if state:
+                async with state.lock:
+                    state.skip_votes.clear()
+                    state.skip_message = None
+            await self._reply(interaction, "Skip vote passed. Skipping...")
+            return
+        await self._reply(interaction, f"Skip vote started: {votes}/{required}.")
 
     @discord.ui.button(label="Loop: Off", style=discord.ButtonStyle.primary)
     async def loop_button(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -200,6 +243,8 @@ class GuildPlaybackState:
         self.idle_disconnect_task = None
         self.empty_voice_task = None
         self.manual_disconnect = False
+        self.skip_votes = set()
+        self.skip_message = None
 
 
 def _env_int(name, default):
@@ -325,6 +370,46 @@ class Music(commands.Cog):
             if member.id != voice_client.user.id and not member.bot
         ]
         return len(members) == 0
+
+    def _voice_listener_count(self, voice_client):
+        if voice_client is None or voice_client.channel is None:
+            return 0
+        return sum(1 for member in voice_client.channel.members if not member.bot)
+
+    def _skip_votes_required(self, listener_count):
+        return max(1, (listener_count // 2) + 1)
+
+    def _build_skip_vote_embed(self, votes, required, status=None):
+        if status == "passed":
+            title = "Skip Vote Passed"
+            color = discord.Color.green()
+            description = "Majority reached. Skipping the track."
+        elif status == "failed":
+            title = "Skip Vote Failed"
+            color = discord.Color.red()
+            description = "Not enough votes to skip."
+        else:
+            title = "Skip Vote In Progress"
+            color = discord.Color.orange()
+            description = "Vote to skip the current track."
+        embed = discord.Embed(title=title, description=description, color=color)
+        embed.add_field(name="Votes", value=f"{votes}/{required}", inline=True)
+        embed.add_field(name="Needed", value="More than half", inline=True)
+        return embed
+
+    async def _set_skip_vote_message(self, state, interaction, embed):
+        if not state:
+            return
+        if state.skip_message:
+            try:
+                await state.skip_message.edit(embed=embed)
+                return
+            except (discord.HTTPException, discord.Forbidden):
+                state.skip_message = None
+        try:
+            state.skip_message = await interaction.channel.send(embed=embed)
+        except (discord.HTTPException, discord.Forbidden, AttributeError):
+            state.skip_message = None
 
     async def _maybe_disconnect_if_empty(self, guild):
         voice_client = guild.voice_client
@@ -912,6 +997,8 @@ class Music(commands.Cog):
             entry = state.queue.popleft()
             state.is_playing = True
             state.current_entry = entry
+            state.skip_votes.clear()
+            state.skip_message = None
 
         self._cancel_idle_disconnect(state)
 
@@ -1033,7 +1120,8 @@ class Music(commands.Cog):
         duration = metadata.get('duration')
         if not duration or duration < self.play_reward_min_duration:
             return
-        if elapsed is None or elapsed + 2 < duration:
+        force_reward = bool(entry.pop('force_reward', False))
+        if not force_reward and (elapsed is None or elapsed + 2 < duration):
             return
         track_key = self._reward_track_key(entry)
         if not track_key:
