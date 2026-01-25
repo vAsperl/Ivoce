@@ -30,8 +30,23 @@ def _wait_for_lavalink(host, port, timeout=15):
 
 async def main():
     if os.path.exists(LOCK_FILE):
-        print("Another instance of the bot is already running.")
-        return
+        try:
+            with open(LOCK_FILE, "r") as fh:
+                raw_pid = fh.read().strip()
+            pid = int(raw_pid) if raw_pid else None
+        except (OSError, ValueError):
+            pid = None
+        if pid:
+            try:
+                os.kill(pid, 0)
+                print("Another instance of the bot is already running.")
+                return
+            except OSError:
+                pass
+        try:
+            os.remove(LOCK_FILE)
+        except OSError:
+            pass
 
     lavalink_proc = None
     try:

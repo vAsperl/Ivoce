@@ -149,13 +149,11 @@ class TransportControls(discord.ui.View):
             if requester and interaction.user.id != requester.id:
                 entry['force_reward'] = True
             try:
-                await self._stop_voice_client(vc)
+                await self.music_cog._stop_voice_client(vc)
             except Exception:
                 pass
             if state:
-                async with state.lock:
-                    state.skip_votes.clear()
-                    state.skip_message = None
+                await self.music_cog._reset_skip_vote(state)
             await self._reply(interaction, "Skipped to the next track.")
             return
 
@@ -167,25 +165,43 @@ class TransportControls(discord.ui.View):
             votes = len(state.skip_votes)
             required = self.music_cog._skip_votes_required(listener_count)
 
-        embed = self.music_cog._build_skip_vote_embed(votes, required)
-        await self.music_cog._set_skip_vote_message(state, interaction, embed)
+        force_skip_cost = self.music_cog._force_skip_cost(state, listener_count)
+        embed = self.music_cog._build_skip_vote_embed(
+            votes,
+            required,
+            force_skip_cost=force_skip_cost,
+            listener_count=listener_count,
+            entry=entry,
+        )
+        view = self.music_cog._build_skip_vote_view(state, force_skip_cost)
+        await self.music_cog._set_skip_vote_message(state, interaction, embed, view=view)
 
         if votes >= required:
             if requester and any(voter_id != requester.id for voter_id in state.skip_votes):
                 entry['force_reward'] = True
-            outcome = self.music_cog._build_skip_vote_embed(votes, required, status="passed")
-            await self.music_cog._set_skip_vote_message(state, interaction, outcome)
+            outcome = self.music_cog._build_skip_vote_embed(
+                votes,
+                required,
+                status="passed",
+                force_skip_cost=force_skip_cost,
+                listener_count=listener_count,
+                entry=entry,
+            )
+            await self.music_cog._set_skip_vote_message(state, interaction, outcome, view=view)
             try:
-                await self._stop_voice_client(vc)
+                await self.music_cog._stop_voice_client(vc)
             except Exception:
                 pass
             if state:
-                async with state.lock:
-                    state.skip_votes.clear()
-                    state.skip_message = None
+                await self.music_cog._reset_skip_vote(state)
             await self._reply(interaction, "Skip vote passed. Skipping...")
             return
-        await self._reply(interaction, f"Skip vote started: {votes}/{required}.")
+        if not interaction.response.is_done():
+            try:
+                await interaction.response.defer()
+            except discord.HTTPException:
+                pass
+        return
 
     @discord.ui.button(label="Loop: Off", style=discord.ButtonStyle.primary)
     async def loop_button(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -233,6 +249,102 @@ class TransportControls(discord.ui.View):
         await self._reply(interaction, "Queue shuffled.")
 
 
+class SkipVoteView(discord.ui.View):
+    def __init__(self, music_cog, state, cost):
+        super().__init__(timeout=None)
+        self.music_cog = music_cog
+        self.state = state
+        self._set_cost_label(cost)
+
+    def _set_cost_label(self, cost):
+        self.force_skip_button.label = f"💸 Force Skip (RM {cost})"
+
+    def _voice_client(self, interaction):
+        if interaction.guild is None:
+            return None
+        return interaction.guild.voice_client
+
+    async def _reply(self, interaction, message):
+        try:
+            await interaction.response.send_message(message, ephemeral=True)
+        except discord.errors.InteractionResponded:
+            pass
+
+    @discord.ui.button(label="💸 Force Skip", style=discord.ButtonStyle.danger)
+    async def force_skip_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        vc = self._voice_client(interaction)
+        if not vc or not (self.music_cog._vc_is_playing(vc) or self.music_cog._vc_is_paused(vc)):
+            await self._reply(interaction, "Nothing is playing to skip.")
+            return
+        state = self.state
+        entry = state.current_entry if state else None
+        if not entry:
+            await self._reply(interaction, "Nothing is playing to skip.")
+            return
+        listener_count = self.music_cog._voice_listener_count(vc)
+        cost = self.music_cog._force_skip_cost(state, listener_count)
+        currency = self.music_cog._get_currency_manager()
+        balance = currency.get_balance(interaction.user.id)
+        if balance < cost:
+            await self._reply(
+                interaction,
+                f"You need RM {cost} to force skip. Balance: RM {balance}.",
+            )
+            return
+        currency.adjust(interaction.user.id, -cost)
+        if state:
+            async with state.lock:
+                state.force_skip_uses += 1
+        requester = entry.get('requester')
+        if requester and interaction.user.id != requester.id:
+            entry['force_reward'] = True
+        try:
+            await self.music_cog._stop_voice_client(vc)
+        except Exception:
+            pass
+        if state:
+            await self.music_cog._reset_skip_vote(state)
+        await self._reply(interaction, f"Force skip used. RM {cost} charged.")
+
+
+class QueueView(discord.ui.View):
+    def __init__(self, music_cog, state, page=1):
+        super().__init__(timeout=120)
+        self.music_cog = music_cog
+        self.state = state
+        self.page = page
+        self._sync_buttons()
+
+    def _sync_buttons(self):
+        total_pages = self.music_cog._queue_page_count(self.state)
+        self.prev_button.disabled = self.page <= 1
+        self.next_button.disabled = self.page >= total_pages
+
+    async def _edit(self, interaction):
+        embed = self.music_cog._build_queue_embed(self.state, page=self.page)
+        self._sync_buttons()
+        try:
+            await interaction.response.edit_message(embed=embed, view=self)
+        except discord.errors.InteractionResponded:
+            try:
+                await interaction.message.edit(embed=embed, view=self)
+            except discord.HTTPException:
+                pass
+
+    @discord.ui.button(label="Prev", style=discord.ButtonStyle.secondary)
+    async def prev_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if self.page > 1:
+            self.page -= 1
+        await self._edit(interaction)
+
+    @discord.ui.button(label="Next", style=discord.ButtonStyle.primary)
+    async def next_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        total_pages = self.music_cog._queue_page_count(self.state)
+        if self.page < total_pages:
+            self.page += 1
+        await self._edit(interaction)
+
+
 class GuildPlaybackState:
     def __init__(self):
         self.queue = deque()
@@ -245,6 +357,8 @@ class GuildPlaybackState:
         self.manual_disconnect = False
         self.skip_votes = set()
         self.skip_message = None
+        self.skip_view = None
+        self.force_skip_uses = 0
 
 
 def _env_int(name, default):
@@ -282,6 +396,7 @@ class Music(commands.Cog):
         self.play_reward_batch_amount = _env_int("MUSIC_REWARD_BATCH_AMOUNT", 50)
         self.play_reward_counts = {}
         self.disable_loop_rewards = _env_flag("DISABLE_LOOP_REWARDS", default=False)
+        self.force_skip_base_cost = _env_int("MUSIC_FORCE_SKIP_BASE_COST", 100)
 
     def _load_pomice_node_specs(self):
         raw = os.getenv("POMICE_NODES", "").strip()
@@ -353,6 +468,14 @@ class Music(commands.Cog):
             return voice_client.is_paused
         return voice_client.is_paused()
 
+    async def _stop_voice_client(self, voice_client):
+        if not voice_client:
+            return
+        if self._is_pomice_player(voice_client):
+            await voice_client.stop()
+        else:
+            voice_client.stop()
+
     def _get_state(self, guild):
         if guild is None:
             return None
@@ -379,7 +502,13 @@ class Music(commands.Cog):
     def _skip_votes_required(self, listener_count):
         return max(1, (listener_count // 2) + 1)
 
-    def _build_skip_vote_embed(self, votes, required, status=None):
+    def _force_skip_cost(self, state, listener_count):
+        skip_uses = getattr(state, "force_skip_uses", 0)
+        multiplier = 2 ** skip_uses
+        user_multiplier = max(1, listener_count - 1)
+        return self.force_skip_base_cost * multiplier * user_multiplier
+
+    def _build_skip_vote_embed(self, votes, required, status=None, force_skip_cost=None, listener_count=None, entry=None):
         if status == "passed":
             title = "Skip Vote Passed"
             color = discord.Color.green()
@@ -391,25 +520,55 @@ class Music(commands.Cog):
         else:
             title = "Skip Vote In Progress"
             color = discord.Color.orange()
-            description = "Vote to skip the current track."
+            description = self._format_queue_entry_title(entry) if entry else "Vote to skip the current track."
         embed = discord.Embed(title=title, description=description, color=color)
         embed.add_field(name="Votes", value=f"{votes}/{required}", inline=True)
         embed.add_field(name="Needed", value="More than half", inline=True)
+        if entry:
+            thumbnail = (entry.get('metadata') or {}).get('thumbnail')
+            if thumbnail:
+                embed.set_thumbnail(url=thumbnail)
         return embed
 
-    async def _set_skip_vote_message(self, state, interaction, embed):
+    def _build_skip_vote_view(self, state, force_skip_cost):
+        return SkipVoteView(self, state, force_skip_cost)
+
+    async def _set_skip_vote_message(self, state, interaction, embed, view=None):
         if not state:
             return
         if state.skip_message:
             try:
-                await state.skip_message.edit(embed=embed)
+                await state.skip_message.edit(embed=embed, view=view)
+                state.skip_view = view
                 return
             except (discord.HTTPException, discord.Forbidden):
                 state.skip_message = None
+                state.skip_view = None
         try:
-            state.skip_message = await interaction.channel.send(embed=embed)
+            state.skip_message = await interaction.channel.send(embed=embed, view=view)
+            state.skip_view = view
         except (discord.HTTPException, discord.Forbidden, AttributeError):
             state.skip_message = None
+            state.skip_view = None
+
+    async def _reset_skip_vote(self, state):
+        if not state:
+            return
+        message = None
+        view = None
+        async with state.lock:
+            state.skip_votes.clear()
+            message = state.skip_message
+            view = state.skip_view
+            state.skip_message = None
+            state.skip_view = None
+        if message and view:
+            for item in view.children:
+                item.disabled = True
+            try:
+                await message.edit(view=view)
+            except (discord.HTTPException, discord.Forbidden):
+                pass
 
     async def _maybe_disconnect_if_empty(self, guild):
         voice_client = guild.voice_client
@@ -560,6 +719,20 @@ class Music(commands.Cog):
         thumbnail = metadata.get('thumbnail')
         if thumbnail:
             embed.set_thumbnail(url=thumbnail)
+        embed.set_footer(text="Added to queue")
+        return embed
+
+    def _build_playlist_added_embed(self, name, count, position, requester):
+        title = name or "Playlist"
+        embed = discord.Embed(
+            title="Playlist queued",
+            description=title,
+            color=discord.Color.green()
+        )
+        embed.add_field(name="Tracks added", value=str(count), inline=True)
+        embed.add_field(name="Starting position", value=f"#{position}", inline=True)
+        if requester:
+            embed.add_field(name="Requested by", value=requester.display_name, inline=True)
         embed.set_footer(text="Added to queue")
         return embed
 
@@ -745,7 +918,13 @@ class Music(commands.Cog):
         self._start_now_playing_timestamp_updates(entry, state)
         return msg
 
-    def _build_queue_embed(self, state):
+    def _queue_page_count(self, state, page_size=10):
+        if not state:
+            return 1
+        total = len(state.queue)
+        return max(1, (total + page_size - 1) // page_size)
+
+    def _build_queue_embed(self, state, page=1):
         embed = discord.Embed(title="Queue", color=discord.Color.green())
         if not state:
             embed.description = "Nothing is playing right now."
@@ -763,8 +942,13 @@ class Music(commands.Cog):
         else:
             embed.description = "Nothing is playing right now."
 
+        page_size = 10
+        total_pages = self._queue_page_count(state, page_size=page_size)
+        page = max(1, min(page, total_pages))
+        start = (page - 1) * page_size
+        end = start + page_size
         queue_lines = []
-        for idx, entry in enumerate(list(state.queue)[:10], start=1):
+        for idx, entry in enumerate(list(state.queue)[start:end], start=start + 1):
             title = entry.get('title') or entry['url']
             requester = entry['requester'].display_name
             queue_title = self._format_queue_entry_title(entry)
@@ -782,7 +966,10 @@ class Music(commands.Cog):
                 inline=False,
             )
 
-        embed.set_footer(text=f"Loop mode: {state.loop_mode.capitalize()}, total {len(state.queue)} tracks waiting")
+        footer = f"Loop mode: {state.loop_mode.capitalize()}, total {len(state.queue)} tracks waiting"
+        if total_pages > 1:
+            footer += f" • Page {page}/{total_pages}"
+        embed.set_footer(text=footer)
         return embed
 
     def _build_usage_embed(self, usage, example=None):
@@ -817,7 +1004,7 @@ class Music(commands.Cog):
             return
         await self._safe_delete_message(ctx.message)
 
-        entry = {
+        base_entry = {
             'url': url,
             'requester': ctx.author,
             'guild': ctx.guild,
@@ -828,34 +1015,73 @@ class Music(commands.Cog):
             'loading_message': None,
             'state': None,
         }
-        pomice_track = await self._resolve_pomice_track(entry, ctx)
-        if pomice_track:
-            entry['pomice_track'] = pomice_track
+        entries = []
+        results = await self._resolve_pomice_results(url, ctx)
+        playlist = results if pomice and isinstance(results, pomice.Playlist) else None
+        if playlist and getattr(playlist, "tracks", None):
+            entries = [self._build_entry_from_track(base_entry, track) for track in playlist.tracks]
+        else:
+            entry = dict(base_entry)
+            pomice_track = None
+            if results is not None:
+                pomice_track = self._extract_pomice_track(results)
+            else:
+                pomice_track = await self._resolve_pomice_track(entry, ctx)
+            if pomice_track:
+                entry['pomice_track'] = pomice_track
+                if not entry.get('metadata'):
+                    self._apply_pomice_track_metadata(entry, pomice_track)
+            entries = [entry]
 
         state = self._get_state(ctx.guild)
-        entry['state'] = state
         state.manual_disconnect = False
         async with state.lock:
             queue_position = len(state.queue) + 1
-            state.queue.append(entry)
-            should_ack_queue = len(state.queue) > 1 or state.is_playing
+            should_ack_queue = len(state.queue) > 0 or state.is_playing
+            for entry in entries:
+                entry['state'] = state
+                state.queue.append(entry)
 
-        if not should_ack_queue:
-            track_line = entry['url'] if not entry.get('title') else self._format_queue_entry_title(entry)
-            description = (
-                f"{track_line}\n"
-                f"Requested by {entry['requester'].display_name}"
-            )
-            embed = self._build_status_embed(
-                "Loading track...",
-                description,
-                color=discord.Color.orange(),
-                footer="Preparing your playback"
-            )
-            entry['loading_message'] = await ctx.send(embed=embed)
+        first_entry = entries[0]
+        if playlist and entries:
+            playlist_name = getattr(playlist, "name", None) or getattr(playlist, "title", None)
+            if not should_ack_queue:
+                description = (
+                    f"{playlist_name or 'Playlist'}\n"
+                    f"Requested by {first_entry['requester'].display_name}"
+                )
+                embed = self._build_status_embed(
+                    "Loading playlist...",
+                    description,
+                    color=discord.Color.orange(),
+                    footer="Preparing your playback"
+                )
+                first_entry['loading_message'] = await ctx.send(embed=embed)
+            else:
+                embed = self._build_playlist_added_embed(
+                    playlist_name,
+                    len(entries),
+                    queue_position,
+                    first_entry.get('requester'),
+                )
+                await ctx.send(embed=embed)
         else:
-            embed = self._build_queue_added_embed(entry, queue_position)
-            await ctx.send(embed=embed)
+            if not should_ack_queue:
+                track_line = first_entry['url'] if not first_entry.get('title') else self._format_queue_entry_title(first_entry)
+                description = (
+                    f"{track_line}\n"
+                    f"Requested by {first_entry['requester'].display_name}"
+                )
+                embed = self._build_status_embed(
+                    "Loading track...",
+                    description,
+                    color=discord.Color.orange(),
+                    footer="Preparing your playback"
+                )
+                first_entry['loading_message'] = await ctx.send(embed=embed)
+            else:
+                embed = self._build_queue_added_embed(first_entry, queue_position)
+                await ctx.send(embed=embed)
 
         await self._start_next_in_queue(state, ctx.guild)
 
@@ -921,6 +1147,7 @@ class Music(commands.Cog):
         else:
             self.logger.warning("Not in a voice channel.")
             await ctx.send("I am not in a voice channel.")
+            return
         current_entry = state.current_entry
         self._cancel_now_playing_timestamp_updates(current_entry)
         state.current_entry = None
@@ -936,8 +1163,11 @@ class Music(commands.Cog):
     async def queue_list(self, ctx):
         """List the currently playing track plus upcoming songs."""
         state = self._get_state(ctx.guild)
-        embed = self._build_queue_embed(state)
-        await ctx.send(embed=embed)
+        embed = self._build_queue_embed(state, page=1)
+        view = None
+        if state and len(state.queue) > 10:
+            view = QueueView(self, state, page=1)
+        await ctx.send(embed=embed, view=view)
 
     @commands.command(name="remove")
     async def remove_from_queue(self, ctx, pos: int):
@@ -989,6 +1219,7 @@ class Music(commands.Cog):
         await self._send_now_playing_embed(ctx.channel, entry, state, embed, view, replace=True)
 
     async def _start_next_in_queue(self, state, guild):
+        await self._reset_skip_vote(state)
         async with state.lock:
             if state.manual_disconnect:
                 return
@@ -997,8 +1228,6 @@ class Music(commands.Cog):
             entry = state.queue.popleft()
             state.is_playing = True
             state.current_entry = entry
-            state.skip_votes.clear()
-            state.skip_message = None
 
         self._cancel_idle_disconnect(state)
 
@@ -1045,6 +1274,15 @@ class Music(commands.Cog):
         if isinstance(results, list) or isinstance(results, tuple):
             return results[0] if results else None
         return results
+
+    def _build_entry_from_track(self, base_entry, track):
+        entry = dict(base_entry)
+        entry['url'] = getattr(track, "uri", None) or base_entry['url']
+        entry['title'] = getattr(track, "title", None) or entry['url']
+        entry['metadata'] = None
+        entry['pomice_track'] = track
+        self._apply_pomice_track_metadata(entry, track)
+        return entry
 
     async def _play_entry_with_pomice(self, entry, state, guild, voice_channel, text_channel):
         if not pomice:
@@ -1173,7 +1411,7 @@ class Music(commands.Cog):
             new_balance,
         )
 
-    async def _resolve_pomice_track(self, entry, ctx=None):
+    async def _resolve_pomice_results(self, url, ctx=None):
         if not pomice or not self._should_use_pomice():
             return None
         try:
@@ -1181,14 +1419,17 @@ class Music(commands.Cog):
         except Exception:
             return None
         try:
-            results = await node.get_tracks(query=entry['url'], ctx=ctx)
-            track = self._extract_pomice_track(results)
-            if track:
-                self._apply_pomice_track_metadata(entry, track)
-            return track
+            return await node.get_tracks(query=url, ctx=ctx)
         except Exception as exc:
             self.logger.warning("Pomice track lookup failed for queue metadata: %s", exc)
             return None
+
+    async def _resolve_pomice_track(self, entry, ctx=None):
+        results = await self._resolve_pomice_results(entry['url'], ctx=ctx)
+        track = self._extract_pomice_track(results)
+        if track:
+            self._apply_pomice_track_metadata(entry, track)
+        return track
 
     async def _complete_entry(self, state, entry):
         if entry and entry.get('stopped_due_to_empty_vc'):
