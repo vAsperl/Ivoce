@@ -208,7 +208,8 @@ class Profile(commands.Cog):
             await ctx.send("Profile system is unavailable right now.")
             return
         if not url:
-            await ctx.send("Usage: `?profilebg <imgur link>`")
+            prefix = ctx.prefix or "?"
+            await ctx.send(f"Usage: `{prefix}profilebg <imgur link>`")
             return
         normalized = self._normalize_imgur_url(url)
         if not normalized:

@@ -42,6 +42,12 @@ class CurrencyManager:
         self._save()
         return self._balances[key]
 
+    def set_balance(self, user_id, amount):
+        key = str(user_id)
+        self._balances[key] = max(int(amount), 0)
+        self._save()
+        return self._balances[key]
+
     def is_new_user(self, user_id):
         return str(user_id) not in self._balances
 
@@ -214,6 +220,22 @@ class Games(commands.Cog):
         self.poker_profile_path = os.getenv("POKER_PROFILE_PATH", "data/poker_profiles.json")
         self.poker_profiles = self._load_poker_profiles()
         self.poker_games = {}
+
+    def _format_rm(self, amount):
+        try:
+            return f"{int(amount):,}"
+        except (TypeError, ValueError):
+            return str(amount)
+
+    def _get_prefix(self, ctx=None):
+        if ctx and getattr(ctx, "prefix", None):
+            return ctx.prefix
+        prefix = getattr(self.bot, "command_prefix", "?")
+        if isinstance(prefix, (list, tuple)) and prefix:
+            return prefix[0]
+        if isinstance(prefix, str):
+            return prefix
+        return "?"
 
     def _load_persona_lines(self):
         if not os.path.exists(self.persona_path):
@@ -1068,7 +1090,11 @@ class Games(commands.Cog):
         user_id = interaction.user.id
         game = self.poker_games.get(user_id)
         if not game:
-            await interaction.response.send_message("You don't have an active hand. Start one with ?poker <bet>.", ephemeral=True)
+            prefix = self._get_prefix()
+            await interaction.response.send_message(
+                f"You don't have an active hand. Start one with {prefix}poker <bet>.",
+                ephemeral=True,
+            )
             return
         if game.get("locked"):
             await interaction.response.send_message("Hold on, finishing the last action.", ephemeral=True)
@@ -1291,16 +1317,18 @@ class Games(commands.Cog):
     @commands.command(aliases=["bal"])
     async def balance(self, ctx):
         bal = self.currency.get_balance(ctx.author.id)
+        formatted = self._format_rm(bal)
+        prefix = self._get_prefix(ctx)
         embed = discord.Embed(
             title="Balance",
-            description=f"{ctx.author.mention}, you have RM {bal}.",
+            description=f"{ctx.author.mention}, you have RM {formatted}.",
             color=discord.Color.green(),
         )
         embed.add_field(
             name="Tips",
             value=(
-                "• Use `?daily` for a daily reward.\n"
-                "• Play full-length songs with `?play` to earn RM.\n"
+                f"• Use `{prefix}daily` for a daily reward.\n"
+                f"• Play full-length songs with `{prefix}play` to earn RM.\n"
                 "• Avoid replaying the same song repeatedly."
             ),
             inline=False,
@@ -1327,7 +1355,7 @@ class Games(commands.Cog):
         for idx, (user_id, balance_value) in enumerate(top, start=1):
             member = ctx.guild.get_member(user_id) if ctx.guild else None
             name = member.display_name if member else f"<@{user_id}>"
-            lines.append(f"{idx}. {name} — RM {balance_value}")
+            lines.append(f"{idx}. {name} — RM {self._format_rm(balance_value)}")
         embed = discord.Embed(
             title="RM Leaderboard",
             description="\n".join(lines),
@@ -1352,20 +1380,27 @@ class Games(commands.Cog):
         self.daily_claims[user_key] = now
         self._save_daily_claims()
         await ctx.send(
-            f"Daily claimed! You received RM {self.DAILY_REWARD}. New balance: RM {new_balance}."
+            "Daily claimed! You received RM "
+            f"{self._format_rm(self.DAILY_REWARD)}. New balance: RM {self._format_rm(new_balance)}."
         )
 
     @commands.command()
     async def donate(self, ctx, *args):
         if len(args) < 2:
-            example = "?donate 10 @user\n?donate 10 123456789012345678"
-            embed = self._build_usage_embed("?donate <amount> <@user or user_id>", example)
+            prefix = ctx.prefix or "?"
+            example = f"{prefix}donate 10 @user\n{prefix}donate 10 123456789012345678"
+            embed = self._build_usage_embed(f"{prefix}donate <amount> <@user or user_id>", example)
             await ctx.send(embed=embed)
             return
         try:
             amount = int(str(args[0]).strip())
         except ValueError:
-            await ctx.send("Amount must be a whole number.")
+            prefix = ctx.prefix or "?"
+            example = f"{prefix}donate 10 @user\n{prefix}donate 10 123456789012345678"
+            embed = self._build_usage_embed(f"{prefix}donate <amount> <@user or user_id>", example)
+            embed.title = "Invalid amount"
+            embed.description = "Amount must be a whole number."
+            await ctx.send(embed=embed)
             return
         target_arg = " ".join(str(part) for part in args[1:]).strip()
         target = None
@@ -1378,28 +1413,57 @@ class Games(commands.Cog):
                 except (discord.NotFound, discord.Forbidden, discord.HTTPException):
                     target = None
         if not target:
-            await ctx.send("I couldn't find that user.")
+            prefix = ctx.prefix or "?"
+            example = f"{prefix}donate 10 @user\n{prefix}donate 10 123456789012345678"
+            embed = self._build_usage_embed(f"{prefix}donate <amount> <@user or user_id>", example)
+            embed.title = "User not found"
+            embed.description = "I couldn't find that user."
+            await ctx.send(embed=embed)
             return
         if amount <= 0:
-            await ctx.send("Amount must be positive.")
+            prefix = ctx.prefix or "?"
+            example = f"{prefix}donate 10 @user\n{prefix}donate 10 123456789012345678"
+            embed = self._build_usage_embed(f"{prefix}donate <amount> <@user or user_id>", example)
+            embed.title = "Invalid amount"
+            embed.description = "Amount must be positive."
+            await ctx.send(embed=embed)
             return
         if target.id == ctx.author.id:
-            await ctx.send("You can't donate to yourself.")
+            embed = discord.Embed(
+                title="Invalid target",
+                description="You can't donate to yourself.",
+                color=discord.Color.orange(),
+            )
+            await ctx.send(embed=embed)
             return
         if target.bot:
-            await ctx.send("You can't donate to bots.")
+            embed = discord.Embed(
+                title="Invalid target",
+                description="You can't donate to bots.",
+                color=discord.Color.orange(),
+            )
+            await ctx.send(embed=embed)
             return
         current_balance = self.currency.get_balance(ctx.author.id)
         if amount > current_balance:
-            await ctx.send("You don't have enough RM for that donation.")
+            embed = discord.Embed(
+                title="Insufficient balance",
+                description=(
+                    "You don't have enough RM for that donation.\n"
+                    f"Current balance: RM {self._format_rm(current_balance)}."
+                ),
+                color=discord.Color.orange(),
+            )
+            await ctx.send(embed=embed)
             return
         new_balance = self.currency.adjust(ctx.author.id, -amount)
         self.currency.adjust(target.id, amount)
         embed = discord.Embed(
             title="Donation Sent",
             description=(
-                f"{ctx.author.display_name} sent RM {amount} to {target.display_name}.\n"
-                f"New balance: RM {new_balance}."
+                f"{ctx.author.display_name} sent RM {self._format_rm(amount)} "
+                f"to {target.display_name}.\n"
+                f"New balance: RM {self._format_rm(new_balance)}."
             ),
             color=discord.Color.green(),
         )
@@ -1408,14 +1472,176 @@ class Games(commands.Cog):
     @commands.command()
     async def cheat(self, ctx, amount: int, target: discord.Member = None):
         if ctx.author.id != 255365914898333707:
-            await ctx.send("You can't use this command.")
+            embed = discord.Embed(
+                title="Access denied",
+                description="You don't have access to this command.",
+                color=discord.Color.red(),
+            )
+            await ctx.send(embed=embed)
             return
         if amount <= 0:
-            await ctx.send("Amount must be positive.")
+            prefix = ctx.prefix or "?"
+            embed = discord.Embed(
+                title="Invalid amount",
+                description="Amount must be a positive integer.",
+                color=discord.Color.orange(),
+            )
+            embed.add_field(
+                name="Usage",
+                value=f"`{prefix}cheat <amount> [@user]`",
+                inline=False,
+            )
+            await ctx.send(embed=embed)
             return
         target = target or ctx.author
         new_balance = self.currency.adjust(target.id, amount)
-        await ctx.send(f"Cheat applied to {target.mention}. New balance: RM {new_balance}.")
+        prefix = ctx.prefix or "?"
+        embed = discord.Embed(
+            title="Cheat applied",
+            description=(
+                f"Target: {target.display_name}\n"
+                f"New balance: RM {self._format_rm(new_balance)}."
+            ),
+            color=discord.Color.green(),
+        )
+        embed.add_field(
+            name="Usage",
+            value=f"`{prefix}cheat <amount> [@user]`",
+            inline=False,
+        )
+        await ctx.send(embed=embed)
+
+    @commands.command()
+    async def cheatset(self, ctx, amount: int, target: discord.Member = None):
+        if ctx.author.id != 255365914898333707:
+            embed = discord.Embed(
+                title="Access denied",
+                description="You don't have access to this command.",
+                color=discord.Color.red(),
+            )
+            await ctx.send(embed=embed)
+            return
+        if amount < 0:
+            prefix = ctx.prefix or "?"
+            embed = discord.Embed(
+                title="Invalid amount",
+                description="Amount must be a non-negative integer.",
+                color=discord.Color.orange(),
+            )
+            embed.add_field(
+                name="Usage",
+                value=f"`{prefix}cheatset <amount> [@user]`",
+                inline=False,
+            )
+            await ctx.send(embed=embed)
+            return
+        target = target or ctx.author
+        new_balance = self.currency.set_balance(target.id, amount)
+        prefix = ctx.prefix or "?"
+        embed = discord.Embed(
+            title="Cheat set applied",
+            description=(
+                f"Target: {target.display_name}\n"
+                f"New balance: RM {self._format_rm(new_balance)}."
+            ),
+            color=discord.Color.green(),
+        )
+        embed.add_field(
+            name="Usage",
+            value=f"`{prefix}cheatset <amount> [@user]`",
+            inline=False,
+        )
+        await ctx.send(embed=embed)
+
+    @cheat.error
+    async def cheat_error(self, ctx, error):
+        if ctx.author.id != 255365914898333707:
+            embed = discord.Embed(
+                title="Access denied",
+                description="You don't have access to this command.",
+                color=discord.Color.red(),
+            )
+            await ctx.send(embed=embed)
+            return
+        if isinstance(error, commands.MissingRequiredArgument):
+            prefix = ctx.prefix or "?"
+            embed = discord.Embed(
+                title="Cheat command",
+                description="Grant RM to yourself or a target user.",
+                color=discord.Color.orange(),
+            )
+            embed.add_field(
+                name="Usage",
+                value=f"`{prefix}cheat <amount> [@user]`",
+                inline=False,
+            )
+            embed.add_field(
+                name="Example",
+                value=f"`{prefix}cheat 500 @user`",
+                inline=False,
+            )
+            await ctx.send(embed=embed)
+            return
+        if isinstance(error, (commands.BadArgument, OverflowError, ValueError)):
+            prefix = ctx.prefix or "?"
+            embed = discord.Embed(
+                title="Invalid input",
+                description="Please provide a valid amount and (optional) user.",
+                color=discord.Color.orange(),
+            )
+            embed.add_field(
+                name="Usage",
+                value=f"`{prefix}cheat <amount> [@user]`",
+                inline=False,
+            )
+            await ctx.send(embed=embed)
+            return
+        raise error
+
+    @cheatset.error
+    async def cheatset_error(self, ctx, error):
+        if ctx.author.id != 255365914898333707:
+            embed = discord.Embed(
+                title="Access denied",
+                description="You don't have access to this command.",
+                color=discord.Color.red(),
+            )
+            await ctx.send(embed=embed)
+            return
+        if isinstance(error, commands.MissingRequiredArgument):
+            prefix = ctx.prefix or "?"
+            embed = discord.Embed(
+                title="Cheatset command",
+                description="Set RM for yourself or a target user.",
+                color=discord.Color.orange(),
+            )
+            embed.add_field(
+                name="Usage",
+                value=f"`{prefix}cheatset <amount> [@user]`",
+                inline=False,
+            )
+            embed.add_field(
+                name="Example",
+                value=f"`{prefix}cheatset 500 @user`",
+                inline=False,
+            )
+            await ctx.send(embed=embed)
+            return
+        if isinstance(error, (commands.BadArgument, OverflowError, ValueError)):
+            prefix = ctx.prefix or "?"
+            embed = discord.Embed(
+                title="Invalid input",
+                description="Please provide a valid amount and (optional) user.",
+                color=discord.Color.orange(),
+            )
+            embed.add_field(
+                name="Usage",
+                value=f"`{prefix}cheatset <amount> [@user]`",
+                inline=False,
+            )
+            await ctx.send(embed=embed)
+            return
+        raise error
 
     @commands.command()
     async def poker(self, ctx, *args):
@@ -1426,6 +1652,7 @@ class Games(commands.Cog):
             current_balance = self.currency.get_balance(user_id)
             starter_credit = max(starting_balance - current_balance, 0)
             if starter_credit:
+                prefix = self._get_prefix(ctx)
                 self.currency.adjust(user_id, starter_credit)
                 embed = discord.Embed(
                     title="Welcome to Micro Poker",
@@ -1438,9 +1665,9 @@ class Games(commands.Cog):
                 embed.add_field(
                     name="Commands",
                     value=(
-                        "• `?poker <bet> [@user]` to start a hand\n"
-                        "• `?balance` or `?bal` to check RM\n"
-                        "• `?daily` for a daily reward"
+                        f"• `{prefix}poker <bet> [@user]` to start a hand\n"
+                        f"• `{prefix}balance` or `{prefix}bal` to check RM\n"
+                        f"• `{prefix}daily` for a daily reward"
                     ),
                     inline=False,
                 )
@@ -1448,8 +1675,9 @@ class Games(commands.Cog):
             self.poker_starters[user_key] = int(time.time())
             self._save_poker_starters()
         if not args:
-            example = "?poker 10\n?poker 10 @user"
-            embed = self._build_usage_embed("?poker <bet> [@user]", example)
+            prefix = self._get_prefix(ctx)
+            example = f"{prefix}poker 10\n{prefix}poker 10 @user"
+            embed = self._build_usage_embed(f"{prefix}poker <bet> [@user]", example)
             await ctx.send(embed=embed)
             return
 

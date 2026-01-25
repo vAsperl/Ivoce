@@ -1088,7 +1088,11 @@ class Music(commands.Cog):
     @play.error
     async def play_error(self, ctx, error):
         if isinstance(error, commands.MissingRequiredArgument):
-            embed = self._build_usage_embed("?play <url or search>", "?play https://example.com")
+            prefix = ctx.prefix or "?"
+            embed = self._build_usage_embed(
+                f"{prefix}play <url or search>",
+                f"{prefix}play https://example.com",
+            )
             await ctx.send(embed=embed)
             return
         raise error
@@ -1121,7 +1125,7 @@ class Music(commands.Cog):
             "Queue cleared",
             "Stopped playback and cleared the queue.",
             color=discord.Color.orange(),
-            footer="Use ?play to start a new track"
+            footer=f"Use {ctx.prefix or '?'}play to start a new track"
         )
         await ctx.send(embed=embed)
 
@@ -1155,7 +1159,7 @@ class Music(commands.Cog):
             "Disconnected",
             "Left voice channel and cleared the queue.",
             color=discord.Color.orange(),
-            footer="Use ?play to start a new track"
+            footer=f"Use {ctx.prefix or '?'}play to start a new track"
         )
         await ctx.send(embed=embed)
 
@@ -1198,7 +1202,11 @@ class Music(commands.Cog):
     @remove_from_queue.error
     async def remove_from_queue_error(self, ctx, error):
         if isinstance(error, commands.MissingRequiredArgument):
-            embed = self._build_usage_embed("?remove <position>", "?remove 2")
+            prefix = ctx.prefix or "?"
+            embed = self._build_usage_embed(
+                f"{prefix}remove <position>",
+                f"{prefix}remove 2",
+            )
             await ctx.send(embed=embed)
             return
         raise error
@@ -1532,6 +1540,17 @@ class Music(commands.Cog):
             return
         entry = state.current_entry
         if not entry:
+            return
+        current_track = entry.get("pomice_track")
+        if current_track and track:
+            current_id = getattr(current_track, "identifier", None)
+            ended_id = getattr(track, "identifier", None)
+            if current_id and ended_id and current_id != ended_id:
+                return
+        reason_name = getattr(reason, "name", str(reason)).upper()
+        if reason_name == "REPLACED":
+            return
+        if reason_name in {"STOPPED", "CLEANUP"} and state.manual_disconnect:
             return
         await self._complete_entry(state, entry)
 

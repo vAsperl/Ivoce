@@ -85,7 +85,8 @@ async def main():
         intents.message_content = True
         intents.members = True
 
-        bot = commands.Bot(command_prefix='?', intents=intents, help_command=None)
+        command_prefix = os.getenv("COMMAND_PREFIX", "#").strip() or "#"
+        bot = commands.Bot(command_prefix=command_prefix, intents=intents, help_command=None)
 
         # Load cogs
         enabled_cogs = os.getenv("ENABLE_COGS", "").strip()
