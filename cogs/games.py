@@ -87,7 +87,7 @@ class PokerBetModal(discord.ui.Modal):
 
 
 class PokerView(discord.ui.View):
-    def __init__(self, cog, ctx, user_id, opponent_id=None, timeout=120):
+    def __init__(self, cog, ctx, user_id, opponent_id=None, timeout=30):
         super().__init__(timeout=timeout)
         self.cog = cog
         self.ctx = ctx
@@ -113,7 +113,7 @@ class PokerView(discord.ui.View):
 
     async def on_timeout(self):
         game = self.cog.poker_games.get(self.user_id)
-        if not game or not game.get("message"):
+        if not game:
             return
         for item in self.children:
             item.disabled = True
@@ -128,8 +128,14 @@ class PokerView(discord.ui.View):
         if user_refund or opponent_refund:
             refund_note = "Hand timed out. Bets refunded."
         embed = self.cog._poker_status_embed(self.ctx, game, footer_text=refund_note)
-        await game["message"].edit(embed=embed, view=self)
+        message = game.get("message")
+        if message:
+            await message.edit(embed=embed, view=self)
+        await self.ctx.send(refund_note)
         self.cog.poker_games.pop(self.user_id, None)
+        opponent_id = game.get("opponent_id")
+        if opponent_id:
+            self.cog.poker_games.pop(opponent_id, None)
 
     @discord.ui.button(label="Check", style=discord.ButtonStyle.secondary)
     async def check(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -1642,6 +1648,53 @@ class Games(commands.Cog):
             await ctx.send(embed=embed)
             return
         raise error
+
+    @commands.command()
+    async def pokerreset(self, ctx):
+        if ctx.author.id != 255365914898333707:
+            embed = discord.Embed(
+                title="Access denied",
+                description="You don't have access to this command.",
+                color=discord.Color.red(),
+            )
+            await ctx.send(embed=embed)
+            return
+        if not self.poker_games:
+            await ctx.send("No active poker games to reset.")
+            return
+        unique_games = []
+        seen_ids = set()
+        for game in self.poker_games.values():
+            game_id = id(game)
+            if game_id in seen_ids:
+                continue
+            seen_ids.add(game_id)
+            unique_games.append(game)
+        for game in unique_games:
+            view = game.get("view")
+            if view:
+                for item in view.children:
+                    item.disabled = True
+            user_refund = game.get("user_total_bet", 0)
+            if user_refund:
+                self.currency.adjust(game["user_id"], user_refund)
+            opponent_id = game.get("opponent_id")
+            opponent_refund = game.get("bot_total_bet", 0) if opponent_id else 0
+            if opponent_id and opponent_refund:
+                self.currency.adjust(opponent_id, opponent_refund)
+            embed = self._poker_status_embed(
+                game["ctx"],
+                game,
+                footer_text="Hand reset by admin. Bets refunded.",
+            )
+            message = game.get("message")
+            if message:
+                try:
+                    await message.edit(embed=embed, view=view)
+                except Exception:
+                    pass
+        self.poker_games.clear()
+        await ctx.send(f"Poker games reset: {len(unique_games)} hand(s) cleared.")
 
     @commands.command()
     async def poker(self, ctx, *args):
