@@ -115,6 +115,7 @@ class PokerView(discord.ui.View):
         game = self.cog.poker_games.get(self.user_id)
         if not game:
             return
+        self.cog._stop_poker_refresh(game)
         for item in self.children:
             item.disabled = True
         refund_note = "Hand timed out."
@@ -615,6 +616,53 @@ class Games(commands.Cog):
             embed.set_thumbnail(url=thumb_avatar)
         return embed
 
+    def _format_win_footer(self, winner_label, pot, winner_total_bet):
+        net = max(0, pot - winner_total_bet)
+        return f"{winner_label} wins RM {pot} (net +RM {net})!"
+
+    def _start_poker_refresh(self, game):
+        task = game.get("refresh_task")
+        if task and not task.done():
+            return
+        game["refresh_task"] = asyncio.create_task(self._poker_refresh_loop(game))
+
+    def _stop_poker_refresh(self, game):
+        task = game.pop("refresh_task", None)
+        if task and not task.done():
+            task.cancel()
+
+    async def _poker_refresh_loop(self, game):
+        while True:
+            await asyncio.sleep(30)
+            if self.poker_games.get(game.get("user_id")) is not game:
+                return
+            message = game.get("message")
+            view = game.get("view")
+            if not message or (view and view.is_finished()):
+                return
+            footer = self._turn_prompt(game, game.get("turn", "user"))
+            embed = self._poker_status_embed(game["ctx"], game, footer_text=footer)
+            self._sync_poker_view(game)
+            try:
+                await message.edit(embed=embed, view=view)
+            except (discord.NotFound, discord.HTTPException):
+                return
+
+    async def _leaderboard_name(self, ctx, user_id):
+        if ctx.guild:
+            member = ctx.guild.get_member(user_id)
+            if member:
+                return member.display_name
+        user = ctx.bot.get_user(user_id)
+        if not user:
+            try:
+                user = await ctx.bot.fetch_user(user_id)
+            except (discord.NotFound, discord.HTTPException):
+                user = None
+        if user:
+            return user.global_name or user.name
+        return f"<@{user_id}>"
+
     def _select_bot_shadow(self, ctx):
         shadow_name = "Bot"
         shadow_avatar = None
@@ -772,7 +820,7 @@ class Games(commands.Cog):
             opponent_name = self._player_display_name(game, "bot")
             if user_wins:
                 self.currency.adjust(game["user_id"], pot)
-                result_text = f"{user_name} wins RM {pot}!"
+                result_text = self._format_win_footer(user_name, pot, game.get("user_total_bet", 0))
             elif user_best == bot_best:
                 split = pot // 2
                 self.currency.adjust(game["user_id"], split)
@@ -780,12 +828,12 @@ class Games(commands.Cog):
                 result_text = "It's a tie! Pot split."
             else:
                 self.currency.adjust(opponent_id, pot)
-                result_text = f"{opponent_name} wins RM {pot}!"
+                result_text = self._format_win_footer(opponent_name, pot, game.get("bot_total_bet", 0))
         else:
             if user_wins:
-                payout = game["user_total_bet"] * 2
-                self.currency.adjust(user_id, payout)
-                result_text = f"You win RM {game['user_total_bet']}!"
+                pot = game.get("pot", game["user_total_bet"] * 2)
+                self.currency.adjust(user_id, pot)
+                result_text = self._format_win_footer("You", pot, game.get("user_total_bet", 0))
             elif user_best == bot_best:
                 payout = game["user_total_bet"]
                 self.currency.adjust(user_id, payout)
@@ -865,6 +913,7 @@ class Games(commands.Cog):
         return True
 
     async def _finish_poker(self, interaction, game, embed, message_text=None):
+        self._stop_poker_refresh(game)
         view = game.get("view")
         if view:
             for item in view.children:
@@ -968,13 +1017,17 @@ class Games(commands.Cog):
                 fold_chance = self._adjust_fold_chance(game, fold_chance)
                 if random.random() < fold_chance:
                     user_id = interaction.user.id if interaction else game["ctx"].author.id
-                    payout = game["user_total_bet"] * 2
-                    self.currency.adjust(user_id, payout)
+                    pot = game.get("pot", game["user_total_bet"] * 2)
+                    self.currency.adjust(user_id, pot)
                     game["bot_status"] = "Bot folds."
                     line = self._pick_persona_line("fold", game=game)
                     persona_name = game.get("bot_shadow_name")
                     persona_avatar = game.get("bot_shadow_avatar")
-                    embed = self._poker_status_embed(game["ctx"], game, footer_text=f"You win RM {game['user_total_bet']}!")
+                    embed = self._poker_status_embed(
+                        game["ctx"],
+                        game,
+                        footer_text=self._format_win_footer("You", pot, game.get("user_total_bet", 0)),
+                    )
                     await self._finish_poker(interaction, game, embed)
                     await self._send_persona_message(game["ctx"], persona_name, persona_avatar, line, game=game)
                     return
@@ -996,13 +1049,17 @@ class Games(commands.Cog):
                 allow_partial = cap_call or self._should_bot_allin(game, to_call)
                 if not allow_partial:
                     user_id = interaction.user.id if interaction else game["ctx"].author.id
-                    payout = game["user_total_bet"] * 2
-                    self.currency.adjust(user_id, payout)
+                    pot = game.get("pot", game["user_total_bet"] * 2)
+                    self.currency.adjust(user_id, pot)
                     game["bot_status"] = "Bot folds."
                     line = self._pick_persona_line("fold", game=game)
                     persona_name = game.get("bot_shadow_name")
                     persona_avatar = game.get("bot_shadow_avatar")
-                    embed = self._poker_status_embed(game["ctx"], game, footer_text=f"You win RM {game['user_total_bet']}!")
+                    embed = self._poker_status_embed(
+                        game["ctx"],
+                        game,
+                        footer_text=self._format_win_footer("You", pot, game.get("user_total_bet", 0)),
+                    )
                     await self._finish_poker(interaction, game, embed)
                     await self._send_persona_message(game["ctx"], persona_name, persona_avatar, line, game=game)
                     return
@@ -1028,13 +1085,17 @@ class Games(commands.Cog):
                 success, all_in = self._record_bot_call_round(game, allow_partial=allow_partial)
                 if not success:
                     user_id = interaction.user.id if interaction else game["ctx"].author.id
-                    payout = game["user_total_bet"] * 2
-                    self.currency.adjust(user_id, payout)
+                    pot = game.get("pot", game["user_total_bet"] * 2)
+                    self.currency.adjust(user_id, pot)
                     game["bot_status"] = "Bot folds."
                     line = self._pick_persona_line("fold", game=game)
                     persona_name = game.get("bot_shadow_name")
                     persona_avatar = game.get("bot_shadow_avatar")
-                    embed = self._poker_status_embed(game["ctx"], game, footer_text=f"You win RM {game['user_total_bet']}!")
+                    embed = self._poker_status_embed(
+                        game["ctx"],
+                        game,
+                        footer_text=self._format_win_footer("You", pot, game.get("user_total_bet", 0)),
+                    )
                     await self._finish_poker(interaction, game, embed)
                     await self._send_persona_message(game["ctx"], persona_name, persona_avatar, line, game=game)
                     return
@@ -1131,7 +1192,13 @@ class Games(commands.Cog):
                 if winner_id:
                     self.currency.adjust(winner_id, pot)
                 game["bot_status"] = f"{self._player_display_name(game, actor)} folded."
-                embed = self._poker_status_embed(game["ctx"], game, footer_text=f"{self._player_display_name(game, opponent)} wins RM {pot}!")
+                winner_name = self._player_display_name(game, opponent)
+                winner_total = game.get("user_total_bet", 0) if opponent == "user" else game.get("bot_total_bet", 0)
+                embed = self._poker_status_embed(
+                    game["ctx"],
+                    game,
+                    footer_text=self._format_win_footer(winner_name, pot, winner_total),
+                )
                 self._record_player_action(user_id, effective_action)
                 await self._finish_poker(interaction, game, embed)
                 return
@@ -1359,8 +1426,7 @@ class Games(commands.Cog):
         top = entries[:10]
         lines = []
         for idx, (user_id, balance_value) in enumerate(top, start=1):
-            member = ctx.guild.get_member(user_id) if ctx.guild else None
-            name = member.display_name if member else f"<@{user_id}>"
+            name = await self._leaderboard_name(ctx, user_id)
             lines.append(f"{idx}. {name} — RM {self._format_rm(balance_value)}")
         embed = discord.Embed(
             title="RM Leaderboard",
@@ -1907,6 +1973,7 @@ class Games(commands.Cog):
             self._sync_poker_view(game)
             message = await ctx.send(embed=embed, view=view)
             game["message"] = message
+            self._start_poker_refresh(game)
             if game["turn"] == "bot" and not opponent:
                 await self._bot_take_turn(None, game)
             return
