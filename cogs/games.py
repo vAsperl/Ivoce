@@ -579,13 +579,17 @@ class Games(commands.Cog):
             inline=False,
         )
         if stage == "showdown":
+            player_name = self._player_display_name(game, "user")
+            opponent_name = self._player_display_name(game, "bot")
+            player_hand_label = "Player hand" if not self._is_pvp(game) else f"{player_name}'s hand"
+            opponent_hand_label = f"{opponent_label} hand" if not self._is_pvp(game) else f"{opponent_name}'s hand"
             embed.add_field(
-                name="Player hand",
+                name=player_hand_label,
                 value=self._format_cards(game["user_cards"]),
                 inline=False,
             )
             embed.add_field(
-                name=f"{opponent_label} hand",
+                name=opponent_hand_label,
                 value=self._format_cards(game["bot_cards"]),
                 inline=False,
             )
