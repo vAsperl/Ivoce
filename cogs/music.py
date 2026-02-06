@@ -1541,6 +1541,17 @@ class Music(commands.Cog):
         entry = state.current_entry
         if not entry:
             return
+        metadata = entry.get("metadata") or {}
+        duration = metadata.get("duration")
+        elapsed = self._get_elapsed_time(entry)
+        title = metadata.get("title") or entry.get("title") or entry.get("url")
+        self.logger.info(
+            "Track end: title=%s duration=%s elapsed=%s reason=%s",
+            title,
+            duration,
+            None if elapsed is None else round(elapsed, 2),
+            getattr(reason, "name", str(reason)),
+        )
         current_track = entry.get("pomice_track")
         if current_track and track:
             current_id = getattr(current_track, "identifier", None)

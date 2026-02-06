@@ -1,12 +1,15 @@
 import discord
-from discord.ext import commands
+from discord.ext import commands, tasks
 import itertools
 import random
 import asyncio
+import logging
 import json
 import os
 import time
 import re
+import datetime
+import uuid
 
 
 class CurrencyManager:
@@ -87,12 +90,13 @@ class PokerBetModal(discord.ui.Modal):
 
 
 class PokerView(discord.ui.View):
-    def __init__(self, cog, ctx, user_id, opponent_id=None, timeout=30):
+    def __init__(self, cog, ctx, user_id, opponent_id=None, timeout=120, hand_id=None):
         super().__init__(timeout=timeout)
         self.cog = cog
         self.ctx = ctx
         self.user_id = user_id
         self.opponent_id = opponent_id
+        self.hand_id = hand_id
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id not in {self.user_id, self.opponent_id}:
@@ -100,6 +104,9 @@ class PokerView(discord.ui.View):
             return False
         game = self.cog.poker_games.get(interaction.user.id)
         if not game:
+            await interaction.response.send_message("That hand is no longer active.", ephemeral=True)
+            return False
+        if self.hand_id and game.get("hand_id") != self.hand_id:
             await interaction.response.send_message("That hand is no longer active.", ephemeral=True)
             return False
         actor = self.cog._player_key(game, interaction.user.id)
@@ -115,6 +122,23 @@ class PokerView(discord.ui.View):
         game = self.cog.poker_games.get(self.user_id)
         if not game:
             return
+        if self.hand_id and game.get("hand_id") != self.hand_id:
+            return
+        if game.get("completed"):
+            return
+        game["timed_out"] = True
+        try:
+            self.cog.poker_logger.info(
+                "poker_timeout user_id=%s opponent_id=%s stage=%s pot=%s user_total_bet=%s bot_total_bet=%s",
+                game.get("user_id"),
+                game.get("opponent_id"),
+                game.get("stage"),
+                game.get("pot"),
+                game.get("user_total_bet"),
+                game.get("bot_total_bet"),
+            )
+        except Exception:
+            self.cog.poker_logger.exception("poker_timeout logging failed")
         self.cog._stop_poker_refresh(game)
         for item in self.children:
             item.disabled = True
@@ -201,6 +225,11 @@ class Games(commands.Cog):
     RANK_ORDER = "23456789TJQKA"
     DAILY_REWARD = 1000
     DAILY_COOLDOWN = 60 * 60 * 24
+    LOTTERY_ENTRY_FEE = 100
+    LOTTERY_BASE_POT = 50000
+    LOTTERY_DRAW_TIME = datetime.time(
+        hour=0, minute=0, tzinfo=datetime.timezone(datetime.timedelta(hours=8))
+    )
     CATEGORY_NAMES = [
         "High Card",
         "Pair",
@@ -216,8 +245,20 @@ class Games(commands.Cog):
 
     def __init__(self, bot):
         self.bot = bot
+        self.poker_logger = logging.getLogger("poker")
+        if not self.poker_logger.handlers:
+            handler = logging.FileHandler(filename="poker.log", encoding="utf-8", mode="a")
+            handler.setFormatter(
+                logging.Formatter("[%(asctime)s] [%(levelname)s] %(message)s")
+            )
+            self.poker_logger.addHandler(handler)
+            self.poker_logger.setLevel(logging.INFO)
+            self.poker_logger.propagate = False
         data_file = os.getenv("GAMES_DATAFILE", "games_currency.json")
         self.currency = CurrencyManager(data_file, start_balance=100)
+        self.lottery_path = os.getenv("LOTTERY_DATAFILE", "data/lottery.json")
+        self.lottery_state = self._load_lottery_state()
+        self._lottery_daily_draw.start()
         self.daily_path = os.getenv("GAMES_DAILY_DATAFILE", "games_daily.json")
         self.daily_claims = self._load_daily_claims()
         self.poker_starter_path = os.getenv("GAMES_POKER_STARTER_DATAFILE", "games_poker_starters.json")
@@ -288,6 +329,118 @@ class Games(commands.Cog):
             with open(self.poker_profile_path, "w", encoding="utf-8") as fh:
                 json.dump(self.poker_profiles, fh)
         except OSError:
+            pass
+
+    def _default_lottery_state(self):
+        return {"entries": [], "last_draw": None, "house_earnings": 0}
+
+    def _load_lottery_state(self):
+        if not os.path.exists(self.lottery_path):
+            return self._default_lottery_state()
+        try:
+            with open(self.lottery_path, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+        except (json.JSONDecodeError, OSError):
+            return self._default_lottery_state()
+        if not isinstance(data, dict):
+            return self._default_lottery_state()
+        entries = data.get("entries", [])
+        if not isinstance(entries, list):
+            entries = []
+        normalized_entries = []
+        for entry in entries:
+            try:
+                normalized_entries.append(int(entry))
+            except (TypeError, ValueError):
+                continue
+        last_draw = data.get("last_draw")
+        if not isinstance(last_draw, str):
+            last_draw = None
+        try:
+            house_earnings = int(data.get("house_earnings", 0))
+        except (TypeError, ValueError):
+            house_earnings = 0
+        return {
+            "entries": normalized_entries,
+            "last_draw": last_draw,
+            "house_earnings": max(0, house_earnings),
+        }
+
+    def _save_lottery_state(self):
+        try:
+            dir_path = os.path.dirname(self.lottery_path)
+            if dir_path:
+                os.makedirs(dir_path, exist_ok=True)
+            with open(self.lottery_path, "w", encoding="utf-8") as fh:
+                json.dump(self.lottery_state, fh)
+        except OSError:
+            pass
+
+    def _lottery_today_key(self):
+        return datetime.datetime.now(datetime.timezone.utc).date().isoformat()
+
+    def _lottery_pot(self):
+        entries = self.lottery_state.get("entries", [])
+        house_earnings = self.lottery_state.get("house_earnings", 0)
+        return len(entries) * self.LOTTERY_ENTRY_FEE + house_earnings + self.LOTTERY_BASE_POT
+
+    def _record_house_earnings(self, amount, reason=None):
+        if amount <= 0:
+            return
+        self.lottery_state["house_earnings"] = self.lottery_state.get("house_earnings", 0) + amount
+        self._save_lottery_state()
+        if reason:
+            try:
+                self.poker_logger.info("house_earnings_add amount=%s reason=%s", amount, reason)
+            except Exception:
+                self.poker_logger.exception("house_earnings_add logging failed")
+
+    async def _run_lottery_draw(self):
+        today = self._lottery_today_key()
+        if self.lottery_state.get("last_draw") == today:
+            return
+        entries = self.lottery_state.get("entries", [])
+        if not entries:
+            self.lottery_state["last_draw"] = today
+            self._save_lottery_state()
+            return
+        winner_id = random.choice(entries)
+        pot = self._lottery_pot()
+        self.currency.adjust(winner_id, pot)
+        self.lottery_state["entries"] = []
+        self.lottery_state["house_earnings"] = 0
+        self.lottery_state["last_draw"] = today
+        self._save_lottery_state()
+        channel_id = os.getenv("LOTTERY_ANNOUNCE_CHANNEL")
+        if channel_id:
+            try:
+                channel = self.bot.get_channel(int(channel_id))
+                if channel is None:
+                    channel = await self.bot.fetch_channel(int(channel_id))
+                if channel:
+                    await channel.send(f"Daily lottery winner: <@{winner_id}> wins RM {pot}!")
+            except Exception:
+                self.poker_logger.exception("lottery_announce_failed channel_id=%s", channel_id)
+
+    @tasks.loop(time=LOTTERY_DRAW_TIME)
+    async def _lottery_daily_draw(self):
+        await self._run_lottery_draw()
+
+    @_lottery_daily_draw.before_loop
+    async def _lottery_daily_draw_before(self):
+        await self.bot.wait_until_ready()
+        now = datetime.datetime.now(self.LOTTERY_DRAW_TIME.tzinfo)
+        draw_time = self.LOTTERY_DRAW_TIME
+        next_draw = datetime.datetime.combine(now.date(), draw_time)
+        if next_draw.tzinfo is None:
+            next_draw = next_draw.replace(tzinfo=datetime.timezone.utc)
+        if now >= next_draw:
+            await self._run_lottery_draw()
+
+    def cog_unload(self):
+        try:
+            self._lottery_daily_draw.cancel()
+        except Exception:
             pass
 
     def _record_player_action(self, user_id, action):
@@ -635,10 +788,13 @@ class Games(commands.Cog):
         if task and not task.done():
             task.cancel()
 
+    def _is_game_active(self, game):
+        return self.poker_games.get(game.get("user_id")) is game
+
     async def _poker_refresh_loop(self, game):
         while True:
             await asyncio.sleep(30)
-            if self.poker_games.get(game.get("user_id")) is not game:
+            if not self._is_game_active(game):
                 return
             message = game.get("message")
             view = game.get("view")
@@ -809,6 +965,8 @@ class Games(commands.Cog):
         return f"{name}'s move: {action_text}."
 
     async def _resolve_showdown(self, interaction, game):
+        if game.get("timed_out") or not self._is_game_active(game):
+            return
         game["stage"] = "showdown"
         user_best = self._best_hand(game["user_cards"] + game["community"])
         bot_best = self._best_hand(game["bot_cards"] + game["community"])
@@ -843,6 +1001,7 @@ class Games(commands.Cog):
                 self.currency.adjust(user_id, payout)
                 result_text = "It's a tie! Bet returned."
             else:
+                self._record_house_earnings(game.get("user_total_bet", 0), reason="bot_win_showdown")
                 result_text = f"You lose RM {game['user_total_bet']}."
 
         game["bot_status"] = "Showdown."
@@ -874,6 +1033,8 @@ class Games(commands.Cog):
             await self._send_persona_message(game["ctx"], persona_name, persona_avatar, persona_line, game=game)
 
     async def _maybe_finish_round(self, interaction, game, *, delay_on_advance=0):
+        if game.get("timed_out") or not self._is_game_active(game):
+            return False
         awaiting_player = game.get("awaiting_call")
         if awaiting_player:
             if (
@@ -920,6 +1081,8 @@ class Games(commands.Cog):
         self._stop_poker_refresh(game)
         view = game.get("view")
         if view:
+            game["completed"] = True
+            view.stop()
             for item in view.children:
                 item.disabled = True
         user_id = interaction.user.id if interaction else game["ctx"].author.id
@@ -989,407 +1152,499 @@ class Games(commands.Cog):
         return None
 
     async def _bot_take_turn(self, interaction, game):
-        if self._is_pvp(game):
-            game["locked"] = False
-            return
-        if game.get("bot_acted") and not game.get("awaiting_call"):
-            game["locked"] = False
-            await self._maybe_finish_round(interaction, game, delay_on_advance=1.0)
-            return
-        game["locked"] = True
-        game["bot_status"] = "Bot is deciding..."
-        thinking_embed = self._poker_status_embed(game["ctx"], game, footer_text=self._turn_prompt(game, "bot"))
-        self._sync_poker_view(game)
-        if interaction:
-            await self._update_interaction(interaction, thinking_embed, view=game.get("view"))
-        else:
-            await self._update_game_message(game, thinking_embed)
-        await self._bot_think(game)
-        to_call = self._amount_to_call(game, "bot")
-
-        if game.get("bot_all_in"):
-            game["bot_acted"] = True
-            game["awaiting_call"] = None
-        elif to_call > 0:
-            bot_shoved = False
-            max_bet = game.get("max_bet", 0)
-            cap_call = max_bet and game.get("current_bet", 0) >= max_bet
-            if not cap_call:
-                fold_chance = game.get("fold_chance")
-                if fold_chance is None:
-                    fold_chance = self._refresh_fold_chance(game)
-                fold_chance = self._adjust_fold_chance(game, fold_chance)
-                if random.random() < fold_chance:
-                    user_id = interaction.user.id if interaction else game["ctx"].author.id
-                    pot = game.get("pot", game["user_total_bet"] * 2)
-                    self.currency.adjust(user_id, pot)
-                    game["bot_status"] = "Bot folds."
-                    line = self._pick_persona_line("fold", game=game)
-                    persona_name = game.get("bot_shadow_name")
-                    persona_avatar = game.get("bot_shadow_avatar")
-                    embed = self._poker_status_embed(
-                        game["ctx"],
-                        game,
-                        footer_text=self._format_win_footer("You", pot, game.get("user_total_bet", 0)),
-                    )
-                    await self._finish_poker(interaction, game, embed)
-                    await self._send_persona_message(game["ctx"], persona_name, persona_avatar, line, game=game)
-                    return
-            if cap_call and game.get("bot_bankroll", 0) > 0:
-                target_total = max_bet
-                contribution = max(0, target_total - game.get("bot_round_bet", 0))
-                amount = min(contribution, game.get("bot_bankroll", 0))
-                contributed = self._record_bot_raise(game, amount) if amount > 0 else 0
-                if contributed > 0:
-                    game["current_bet"] = game.get("bot_round_bet", game.get("current_bet", 0))
-                    game["raise_count"] = game.get("raise_count", 0) + 1
-                    game["awaiting_call"] = "user"
-                    game["bot_allin_capped"] = True
-                    game["bot_status"] = "Bot goes all-in."
-                    game["bot_acted"] = True
-                    bot_shoved = True
-            allow_partial = cap_call
-            if to_call > game.get("bot_bankroll", 0):
-                allow_partial = cap_call or self._should_bot_allin(game, to_call)
-                if not allow_partial:
-                    user_id = interaction.user.id if interaction else game["ctx"].author.id
-                    pot = game.get("pot", game["user_total_bet"] * 2)
-                    self.currency.adjust(user_id, pot)
-                    game["bot_status"] = "Bot folds."
-                    line = self._pick_persona_line("fold", game=game)
-                    persona_name = game.get("bot_shadow_name")
-                    persona_avatar = game.get("bot_shadow_avatar")
-                    embed = self._poker_status_embed(
-                        game["ctx"],
-                        game,
-                        footer_text=self._format_win_footer("You", pot, game.get("user_total_bet", 0)),
-                    )
-                    await self._finish_poker(interaction, game, embed)
-                    await self._send_persona_message(game["ctx"], persona_name, persona_avatar, line, game=game)
-                    return
-            bet_allowed = game.get("raise_count", 0) < game.get("max_raises", 10)
-            max_bet = game.get("max_bet", 0)
-            if bet_allowed and max_bet and random.random() < self._bot_allin_chance(game):
-                target_total = max_bet
-                contribution = max(0, target_total - game.get("bot_round_bet", 0))
-                amount = min(contribution, game.get("bot_bankroll", 0))
-                contributed = self._record_bot_raise(game, amount) if amount > 0 else 0
-                if contributed > 0:
-                    game["current_bet"] = game.get("bot_round_bet", game.get("current_bet", 0))
-                    game["raise_count"] = game.get("raise_count", 0) + 1
-                    game["awaiting_call"] = "user"
-                    if max_bet and game.get("bot_round_bet", 0) >= max_bet and game.get("bot_bankroll", 0) > 0:
-                        game["bot_allin_capped"] = True
-                    game["bot_status"] = "Bot goes all-in."
-                    game["bot_acted"] = True
-                    bot_shoved = True
-            if bot_shoved:
-                pass
+        try:
+            if game.get("timed_out") or not self._is_game_active(game):
+                return
+            if self._is_pvp(game):
+                game["locked"] = False
+                return
+            if game.get("bot_acted") and not game.get("awaiting_call"):
+                game["locked"] = False
+                await self._maybe_finish_round(interaction, game, delay_on_advance=1.0)
+                return
+            game["locked"] = True
+            game["bot_status"] = "Bot is deciding..."
+            thinking_embed = self._poker_status_embed(game["ctx"], game, footer_text=self._turn_prompt(game, "bot"))
+            self._sync_poker_view(game)
+            if interaction:
+                await self._update_interaction(interaction, thinking_embed, view=game.get("view"))
             else:
-                success, all_in = self._record_bot_call_round(game, allow_partial=allow_partial)
-                if not success:
-                    user_id = interaction.user.id if interaction else game["ctx"].author.id
-                    pot = game.get("pot", game["user_total_bet"] * 2)
-                    self.currency.adjust(user_id, pot)
-                    game["bot_status"] = "Bot folds."
-                    line = self._pick_persona_line("fold", game=game)
-                    persona_name = game.get("bot_shadow_name")
-                    persona_avatar = game.get("bot_shadow_avatar")
-                    embed = self._poker_status_embed(
-                        game["ctx"],
-                        game,
-                        footer_text=self._format_win_footer("You", pot, game.get("user_total_bet", 0)),
-                    )
-                    await self._finish_poker(interaction, game, embed)
-                    await self._send_persona_message(game["ctx"], persona_name, persona_avatar, line, game=game)
-                    return
-                game["bot_status"] = "Bot is all-in." if all_in else "Bot calls."
+                await self._update_game_message(game, thinking_embed)
+            await self._bot_think(game)
+            if game.get("timed_out") or not self._is_game_active(game):
+                return
+            to_call = self._amount_to_call(game, "bot")
+
+            if game.get("bot_all_in"):
                 game["bot_acted"] = True
                 game["awaiting_call"] = None
-        else:
-            bot_shoved = False
-            bet_allowed = game.get("raise_count", 0) < game.get("max_raises", 10)
-            max_bet = game.get("max_bet", 0)
-            if bet_allowed and max_bet and random.random() < self._bot_allin_chance(game):
-                target_total = max_bet
-                contribution = max(0, target_total - game.get("bot_round_bet", 0))
-                amount = min(contribution, game.get("bot_bankroll", 0))
-                contributed = self._record_bot_raise(game, amount) if amount > 0 else 0
-                if contributed > 0:
-                    game["current_bet"] = game.get("bot_round_bet", game.get("current_bet", 0))
-                    game["raise_count"] = game.get("raise_count", 0) + 1
-                    game["awaiting_call"] = "user"
-                    if max_bet and game.get("bot_round_bet", 0) >= max_bet and game.get("bot_bankroll", 0) > 0:
-                        game["bot_allin_capped"] = True
-                    game["bot_status"] = "Bot goes all-in."
-                    bot_shoved = True
-            if bot_shoved:
-                game["bot_acted"] = True
-            elif bet_allowed and game.get("bot_bankroll", 0) > 0 and random.random() < 0.35:
-                min_bet = game.get("min_bet", 0)
-                current_bet = game.get("current_bet", 0)
-                target_bet = current_bet + min_bet if current_bet > 0 else min_bet
+            elif to_call > 0:
+                bot_shoved = False
                 max_bet = game.get("max_bet", 0)
-                if max_bet and target_bet > max_bet:
-                    target_bet = max_bet
-                contribution = max(0, target_bet - game.get("bot_round_bet", 0))
-                amount = min(contribution, game.get("bot_bankroll", 0))
-                contributed = self._record_bot_raise(game, amount) if amount > 0 else 0
-                if contributed > 0:
-                    game["current_bet"] = game.get("bot_round_bet", game.get("current_bet", 0))
-                    game["raise_count"] = game.get("raise_count", 0) + 1
-                    game["awaiting_call"] = "user"
-                    action = "raises" if current_bet > 0 else "bets"
-                    game["bot_status"] = f"Bot {action} {contributed}."
+                cap_call = max_bet and game.get("current_bet", 0) >= max_bet
+                if not cap_call:
+                    fold_chance = game.get("fold_chance")
+                    if fold_chance is None:
+                        fold_chance = self._refresh_fold_chance(game)
+                    fold_chance = self._adjust_fold_chance(game, fold_chance)
+                    if random.random() < fold_chance:
+                        user_id = interaction.user.id if interaction else game["ctx"].author.id
+                        pot = game.get("pot", game["user_total_bet"] * 2)
+                        self.currency.adjust(user_id, pot)
+                        game["bot_status"] = "Bot folds."
+                        line = self._pick_persona_line("fold", game=game)
+                        persona_name = game.get("bot_shadow_name")
+                        persona_avatar = game.get("bot_shadow_avatar")
+                        embed = self._poker_status_embed(
+                            game["ctx"],
+                            game,
+                            footer_text=self._format_win_footer("You", pot, game.get("user_total_bet", 0)),
+                        )
+                        await self._finish_poker(interaction, game, embed)
+                        await self._send_persona_message(game["ctx"], persona_name, persona_avatar, line, game=game)
+                        return
+                if cap_call and game.get("bot_bankroll", 0) > 0:
+                    target_total = max_bet
+                    contribution = max(0, target_total - game.get("bot_round_bet", 0))
+                    amount = min(contribution, game.get("bot_bankroll", 0))
+                    contributed = self._record_bot_raise(game, amount) if amount > 0 else 0
+                    if contributed > 0:
+                        game["current_bet"] = game.get("bot_round_bet", game.get("current_bet", 0))
+                        game["raise_count"] = game.get("raise_count", 0) + 1
+                        game["awaiting_call"] = "user"
+                        game["bot_allin_capped"] = True
+                        game["bot_status"] = "Bot goes all-in."
+                        game["bot_acted"] = True
+                        bot_shoved = True
+                allow_partial = cap_call
+                if to_call > game.get("bot_bankroll", 0):
+                    allow_partial = cap_call or self._should_bot_allin(game, to_call)
+                    if not allow_partial:
+                        user_id = interaction.user.id if interaction else game["ctx"].author.id
+                        pot = game.get("pot", game["user_total_bet"] * 2)
+                        self.currency.adjust(user_id, pot)
+                        game["bot_status"] = "Bot folds."
+                        line = self._pick_persona_line("fold", game=game)
+                        persona_name = game.get("bot_shadow_name")
+                        persona_avatar = game.get("bot_shadow_avatar")
+                        embed = self._poker_status_embed(
+                            game["ctx"],
+                            game,
+                            footer_text=self._format_win_footer("You", pot, game.get("user_total_bet", 0)),
+                        )
+                        await self._finish_poker(interaction, game, embed)
+                        await self._send_persona_message(game["ctx"], persona_name, persona_avatar, line, game=game)
+                        return
+                bet_allowed = game.get("raise_count", 0) < game.get("max_raises", 10)
+                max_bet = game.get("max_bet", 0)
+                if bet_allowed and max_bet and random.random() < self._bot_allin_chance(game):
+                    target_total = max_bet
+                    contribution = max(0, target_total - game.get("bot_round_bet", 0))
+                    amount = min(contribution, game.get("bot_bankroll", 0))
+                    contributed = self._record_bot_raise(game, amount) if amount > 0 else 0
+                    if contributed > 0:
+                        game["current_bet"] = game.get("bot_round_bet", game.get("current_bet", 0))
+                        game["raise_count"] = game.get("raise_count", 0) + 1
+                        game["awaiting_call"] = "user"
+                        if max_bet and game.get("bot_round_bet", 0) >= max_bet and game.get("bot_bankroll", 0) > 0:
+                            game["bot_allin_capped"] = True
+                        game["bot_status"] = "Bot goes all-in."
+                        game["bot_acted"] = True
+                        bot_shoved = True
+                if bot_shoved:
+                    pass
+                else:
+                    success, all_in = self._record_bot_call_round(game, allow_partial=allow_partial)
+                    if not success:
+                        user_id = interaction.user.id if interaction else game["ctx"].author.id
+                        pot = game.get("pot", game["user_total_bet"] * 2)
+                        self.currency.adjust(user_id, pot)
+                        game["bot_status"] = "Bot folds."
+                        line = self._pick_persona_line("fold", game=game)
+                        persona_name = game.get("bot_shadow_name")
+                        persona_avatar = game.get("bot_shadow_avatar")
+                        embed = self._poker_status_embed(
+                            game["ctx"],
+                            game,
+                            footer_text=self._format_win_footer("You", pot, game.get("user_total_bet", 0)),
+                        )
+                        await self._finish_poker(interaction, game, embed)
+                        await self._send_persona_message(game["ctx"], persona_name, persona_avatar, line, game=game)
+                        return
+                    game["bot_status"] = "Bot is all-in." if all_in else "Bot calls."
+                    game["bot_acted"] = True
+                    game["awaiting_call"] = None
+            else:
+                bot_shoved = False
+                bet_allowed = game.get("raise_count", 0) < game.get("max_raises", 10)
+                max_bet = game.get("max_bet", 0)
+                if bet_allowed and max_bet and random.random() < self._bot_allin_chance(game):
+                    target_total = max_bet
+                    contribution = max(0, target_total - game.get("bot_round_bet", 0))
+                    amount = min(contribution, game.get("bot_bankroll", 0))
+                    contributed = self._record_bot_raise(game, amount) if amount > 0 else 0
+                    if contributed > 0:
+                        game["current_bet"] = game.get("bot_round_bet", game.get("current_bet", 0))
+                        game["raise_count"] = game.get("raise_count", 0) + 1
+                        game["awaiting_call"] = "user"
+                        if max_bet and game.get("bot_round_bet", 0) >= max_bet and game.get("bot_bankroll", 0) > 0:
+                            game["bot_allin_capped"] = True
+                        game["bot_status"] = "Bot goes all-in."
+                        bot_shoved = True
+                if bot_shoved:
+                    game["bot_acted"] = True
+                elif bet_allowed and game.get("bot_bankroll", 0) > 0 and random.random() < 0.35:
+                    min_bet = game.get("min_bet", 0)
+                    current_bet = game.get("current_bet", 0)
+                    target_bet = current_bet + min_bet if current_bet > 0 else min_bet
+                    max_bet = game.get("max_bet", 0)
+                    if max_bet and target_bet > max_bet:
+                        target_bet = max_bet
+                    contribution = max(0, target_bet - game.get("bot_round_bet", 0))
+                    amount = min(contribution, game.get("bot_bankroll", 0))
+                    contributed = self._record_bot_raise(game, amount) if amount > 0 else 0
+                    if contributed > 0:
+                        game["current_bet"] = game.get("bot_round_bet", game.get("current_bet", 0))
+                        game["raise_count"] = game.get("raise_count", 0) + 1
+                        game["awaiting_call"] = "user"
+                        action = "raises" if current_bet > 0 else "bets"
+                        game["bot_status"] = f"Bot {action} {contributed}."
+                    else:
+                        game["bot_status"] = "Bot checks."
                 else:
                     game["bot_status"] = "Bot checks."
-            else:
-                game["bot_status"] = "Bot checks."
-            game["bot_acted"] = True
+                game["bot_acted"] = True
 
-        game["turn"] = "user"
-        embed = self._poker_status_embed(game["ctx"], game, footer_text=self._turn_prompt(game, "user"))
-        self._sync_poker_view(game)
-        if interaction:
-            await self._update_interaction(interaction, embed, view=game.get("view"))
-        else:
-            await self._update_game_message(game, embed)
-        game["locked"] = False
-        await self._maybe_finish_round(interaction, game, delay_on_advance=1.0)
+            game["turn"] = "user"
+            embed = self._poker_status_embed(game["ctx"], game, footer_text=self._turn_prompt(game, "user"))
+            self._sync_poker_view(game)
+            if interaction:
+                await self._update_interaction(interaction, embed, view=game.get("view"))
+            else:
+                await self._update_game_message(game, embed)
+            game["locked"] = False
+            await self._maybe_finish_round(interaction, game, delay_on_advance=1.0)
+        except Exception:
+            self.poker_logger.exception(
+                "poker_bot_turn_error user_id=%s opponent_id=%s stage=%s",
+                game.get("user_id"),
+                game.get("opponent_id"),
+                game.get("stage"),
+            )
+            raise
 
     async def _handle_poker_action(self, interaction, action, amount=None):
         user_id = interaction.user.id
         game = self.poker_games.get(user_id)
-        if not game:
-            prefix = self._get_prefix()
-            await interaction.response.send_message(
-                f"You don't have an active hand. Start one with {prefix}poker <bet>.",
-                ephemeral=True,
-            )
-            return
-        if game.get("locked"):
-            await interaction.response.send_message("Hold on, finishing the last action.", ephemeral=True)
-            return
-        actor = self._player_key(game, user_id)
-        if not actor:
-            await interaction.response.send_message("This isn't your hand.", ephemeral=True)
-            return
-        if game.get("turn") != actor:
-            await interaction.response.send_message("It's not your turn yet.", ephemeral=True)
-            return
-        game["locked"] = True
-        view = game.get("view")
-        to_call = self._amount_to_call(game, actor)
-        effective_action = action
-        if action == "check" and to_call > 0:
-            effective_action = "call"
-        if action == "bet" and to_call > 0:
-            effective_action = "raise"
-        if action == "raise" and to_call == 0:
-            effective_action = "bet"
-
-        if effective_action == "fold":
-            opponent = self._other_player(actor)
-            winner_id = game["user_id"] if opponent == "user" else game.get("opponent_id")
-            if self._is_pvp(game):
-                pot = game.get("pot", 0)
-                if winner_id:
-                    self.currency.adjust(winner_id, pot)
-                game["bot_status"] = f"{self._player_display_name(game, actor)} folded."
-                winner_name = self._player_display_name(game, opponent)
-                winner_total = game.get("user_total_bet", 0) if opponent == "user" else game.get("bot_total_bet", 0)
-                embed = self._poker_status_embed(
-                    game["ctx"],
-                    game,
-                    footer_text=self._format_win_footer(winner_name, pot, winner_total),
+        try:
+            if not game:
+                prefix = self._get_prefix()
+                await interaction.response.send_message(
+                    f"You don't have an active hand. Start one with {prefix}poker <bet>.",
+                    ephemeral=True,
                 )
+                return
+            if game.get("locked"):
+                await interaction.response.send_message("Hold on, finishing the last action.", ephemeral=True)
+                return
+            actor = self._player_key(game, user_id)
+            if not actor:
+                await interaction.response.send_message("This isn't your hand.", ephemeral=True)
+                return
+            if game.get("turn") != actor:
+                await interaction.response.send_message("It's not your turn yet.", ephemeral=True)
+                return
+            game["locked"] = True
+            view = game.get("view")
+            to_call = self._amount_to_call(game, actor)
+            effective_action = action
+            if action == "check" and to_call > 0:
+                effective_action = "call"
+            if action == "bet" and to_call > 0:
+                effective_action = "raise"
+            if action == "raise" and to_call == 0:
+                effective_action = "bet"
+
+            if effective_action == "fold":
+                opponent = self._other_player(actor)
+                winner_id = game["user_id"] if opponent == "user" else game.get("opponent_id")
+                if self._is_pvp(game):
+                    pot = game.get("pot", 0)
+                    if winner_id:
+                        self.currency.adjust(winner_id, pot)
+                    game["bot_status"] = f"{self._player_display_name(game, actor)} folded."
+                    winner_name = self._player_display_name(game, opponent)
+                    winner_total = game.get("user_total_bet", 0) if opponent == "user" else game.get("bot_total_bet", 0)
+                    embed = self._poker_status_embed(
+                        game["ctx"],
+                        game,
+                        footer_text=self._format_win_footer(winner_name, pot, winner_total),
+                    )
+                    self._record_player_action(user_id, effective_action)
+                    await self._finish_poker(interaction, game, embed)
+                    return
+                self._record_house_earnings(game.get("user_total_bet", 0), reason="user_fold")
+                game["bot_status"] = "You folded."
+                embed = self._poker_status_embed(game["ctx"], game, footer_text="Hand over.")
+                line = self._pick_persona_line("fold", game=game)
+                persona_name = game.get("bot_shadow_name")
+                persona_avatar = game.get("bot_shadow_avatar")
                 self._record_player_action(user_id, effective_action)
                 await self._finish_poker(interaction, game, embed)
+                await self._send_persona_message(game["ctx"], persona_name, persona_avatar, line, game=game)
                 return
-            game["bot_status"] = "You folded."
-            embed = self._poker_status_embed(game["ctx"], game, footer_text="Hand over.")
-            line = self._pick_persona_line("fold", game=game)
-            persona_name = game.get("bot_shadow_name")
-            persona_avatar = game.get("bot_shadow_avatar")
-            self._record_player_action(user_id, effective_action)
-            await self._finish_poker(interaction, game, embed)
-            await self._send_persona_message(game["ctx"], persona_name, persona_avatar, line, game=game)
-            return
 
-        if effective_action in ("bet", "raise"):
-            if amount is None or amount <= 0:
-                await interaction.response.send_message("Bet amount must be positive.", ephemeral=True)
-                game["locked"] = False
-                return
-            min_bet = game.get("min_bet", 0)
-            if min_bet and amount < min_bet:
-                await interaction.response.send_message(
-                    f"Minimum bet is RM {min_bet}.",
-                    ephemeral=True,
-                )
-                game["locked"] = False
-                return
-            if game.get("raise_count", 0) >= game.get("max_raises", 10):
-                await interaction.response.send_message("Max raises reached for this round.", ephemeral=True)
-                game["locked"] = False
-                return
-            current_balance = self._player_balance(game, actor)
-            if amount > current_balance:
-                await interaction.response.send_message("You don't have enough RM for that bet.", ephemeral=True)
-                game["locked"] = False
-                return
-            round_key = f"{actor}_round_bet"
-            total_key = f"{actor}_total_bet"
-            new_round_bet = game.get(round_key, 0) + amount
-            if new_round_bet <= game.get("current_bet", 0):
-                await interaction.response.send_message("Raise must exceed the current bet.", ephemeral=True)
-                game["locked"] = False
-                return
-            min_raise_to = game.get("current_bet", 0) + min_bet if min_bet else 0
-            if min_bet and new_round_bet < min_raise_to:
-                await interaction.response.send_message(
-                    f"Minimum raise is RM {min_bet}.",
-                    ephemeral=True,
-                )
-                game["locked"] = False
-                return
-            max_bet = game.get("max_bet", 0)
-            if max_bet and new_round_bet > max_bet:
-                await interaction.response.send_message(f"That exceeds the max bet of RM {max_bet}.", ephemeral=True)
-                game["locked"] = False
-                return
-            self._adjust_player_balance(game, actor, -amount)
-            game[total_key] = game.get(total_key, 0) + amount
-            game[round_key] = new_round_bet
-            game["pot"] = game.get("pot", 0) + amount
-            if self._player_balance(game, actor) == 0:
-                game[f"{actor}_all_in"] = True
-            game["current_bet"] = new_round_bet
-            game["raise_count"] = game.get("raise_count", 0) + 1
-            game["awaiting_call"] = self._other_player(actor)
-            game[f"{actor}_acted"] = True
-            game["turn"] = self._other_player(actor)
-            if self._is_pvp(game):
-                action_word = "raises" if effective_action == "raise" else "bets"
-                game["bot_status"] = f"Last action: {self._player_display_name(game, actor)} {action_word} {amount}."
-            else:
-                game["bot_status"] = "Waiting..."
-            footer_text = self._turn_prompt(game, game["turn"])
-            embed = self._poker_status_embed(game["ctx"], game, footer_text=footer_text)
-            self._sync_poker_view(game)
-            await self._update_interaction(interaction, embed, view=view)
-            self._record_player_action(user_id, effective_action)
-            if not self._is_pvp(game):
-                await self._bot_take_turn(interaction, game)
-            else:
-                finished = await self._maybe_finish_round(interaction, game)
-                if finished:
+            if effective_action in ("bet", "raise"):
+                if amount is None or amount <= 0:
+                    await interaction.response.send_message("Bet amount must be positive.", ephemeral=True)
                     game["locked"] = False
                     return
-                game["locked"] = False
-            return
-
-        if effective_action in ("allin", "all-in"):
-            current_balance = self._player_balance(game, actor)
-            if current_balance <= 0:
-                await interaction.response.send_message("You don't have any RM to go all-in.", ephemeral=True)
-                game["locked"] = False
-                return
-            round_key = f"{actor}_round_bet"
-            total_key = f"{actor}_total_bet"
-            max_bet = game.get("max_bet", 0)
-            current_round_bet = game.get(round_key, 0)
-            max_allowed_total = max_bet if max_bet else current_round_bet + current_balance
-            target_total = min(current_round_bet + current_balance, max_allowed_total)
-            amount_to_allin = target_total - current_round_bet
-            if amount_to_allin <= 0:
-                await interaction.response.send_message(
-                    f"You're already at the max bet of RM {max_bet}.",
-                    ephemeral=True,
-                )
-                game["locked"] = False
-                return
-            if max_bet and target_total >= max_bet and current_balance > amount_to_allin:
-                game[f"{actor}_allin_capped"] = True
-            self._adjust_player_balance(game, actor, -amount_to_allin)
-            game[total_key] = game.get(total_key, 0) + amount_to_allin
-            game[round_key] = current_round_bet + amount_to_allin
-            game["pot"] = game.get("pot", 0) + amount_to_allin
-            game[f"{actor}_all_in"] = amount_to_allin >= current_balance
-            if game[round_key] > game.get("current_bet", 0):
-                game["current_bet"] = game[round_key]
-                game["raise_count"] = game.get("raise_count", 0) + 1
-                game["awaiting_call"] = self._other_player(actor)
-            else:
-                game["awaiting_call"] = None
-            game[f"{actor}_acted"] = True
-            game["turn"] = self._other_player(actor)
-            if self._is_pvp(game):
-                player_name = self._player_display_name(game, actor)
-                game["bot_status"] = f"Last action: {player_name} went all-in for {amount_to_allin}."
-            else:
-                game["bot_status"] = "Waiting..."
-            footer_text = self._turn_prompt(game, game["turn"])
-            embed = self._poker_status_embed(game["ctx"], game, footer_text=footer_text)
-            self._sync_poker_view(game)
-            await self._update_interaction(interaction, embed, view=view)
-            self._record_player_action(user_id, effective_action)
-            if not self._is_pvp(game):
-                await self._bot_take_turn(interaction, game)
-            else:
-                finished = await self._maybe_finish_round(interaction, game)
-                if finished:
+                min_bet = game.get("min_bet", 0)
+                if min_bet and amount < min_bet:
+                    await interaction.response.send_message(
+                        f"Minimum bet is RM {min_bet}.",
+                        ephemeral=True,
+                    )
                     game["locked"] = False
                     return
-                game["locked"] = False
-            return
-
-        if effective_action == "call":
-            amount_to_call = to_call
-            current_balance = self._player_balance(game, actor)
-            if amount_to_call > current_balance:
-                amount_to_call = current_balance
-                game[f"{actor}_all_in"] = True
-            if amount_to_call > 0:
+                if game.get("raise_count", 0) >= game.get("max_raises", 10):
+                    await interaction.response.send_message("Max raises reached for this round.", ephemeral=True)
+                    game["locked"] = False
+                    return
+                current_balance = self._player_balance(game, actor)
+                if amount > current_balance:
+                    await interaction.response.send_message("You don't have enough RM for that bet.", ephemeral=True)
+                    game["locked"] = False
+                    return
                 round_key = f"{actor}_round_bet"
                 total_key = f"{actor}_total_bet"
-                self._adjust_player_balance(game, actor, -amount_to_call)
-                game[total_key] = game.get(total_key, 0) + amount_to_call
-                game[round_key] = game.get(round_key, 0) + amount_to_call
-                game["pot"] = game.get("pot", 0) + amount_to_call
-            game[f"{actor}_acted"] = True
-            game["awaiting_call"] = None
-        elif effective_action == "check":
-            game[f"{actor}_acted"] = True
-        else:
-            await interaction.response.send_message("Invalid action.", ephemeral=True)
-            game["locked"] = False
-            return
-        if self._is_pvp(game):
-            player_name = self._player_display_name(game, actor)
-            if effective_action == "call":
-                game["bot_status"] = f"Last action: {player_name} called {amount_to_call}."
-            else:
-                game["bot_status"] = f"Last action: {player_name} checked."
-
-        self._record_player_action(user_id, effective_action)
-        if game.get("bot_acted") and game.get("user_acted") and not game.get("awaiting_call"):
-            finished = await self._maybe_finish_round(interaction, game)
-            if finished:
-                game["locked"] = False
+                new_round_bet = game.get(round_key, 0) + amount
+                if new_round_bet <= game.get("current_bet", 0):
+                    await interaction.response.send_message("Raise must exceed the current bet.", ephemeral=True)
+                    game["locked"] = False
+                    return
+                min_raise_to = game.get("current_bet", 0) + min_bet if min_bet else 0
+                if min_bet and new_round_bet < min_raise_to:
+                    await interaction.response.send_message(
+                        f"Minimum raise is RM {min_bet}.",
+                        ephemeral=True,
+                    )
+                    game["locked"] = False
+                    return
+                max_bet = game.get("max_bet", 0)
+                if max_bet and new_round_bet > max_bet:
+                    await interaction.response.send_message(
+                        f"That exceeds the max bet of RM {max_bet}.", ephemeral=True
+                    )
+                    game["locked"] = False
+                    return
+                self._adjust_player_balance(game, actor, -amount)
+                game[total_key] = game.get(total_key, 0) + amount
+                game[round_key] = new_round_bet
+                game["pot"] = game.get("pot", 0) + amount
+                if self._player_balance(game, actor) == 0:
+                    game[f"{actor}_all_in"] = True
+                game["current_bet"] = new_round_bet
+                game["raise_count"] = game.get("raise_count", 0) + 1
+                game["awaiting_call"] = self._other_player(actor)
+                game[f"{actor}_acted"] = True
+                game["turn"] = self._other_player(actor)
+                if self._is_pvp(game):
+                    action_word = "raises" if effective_action == "raise" else "bets"
+                    game["bot_status"] = (
+                        f"Last action: {self._player_display_name(game, actor)} {action_word} {amount}."
+                    )
+                else:
+                    game["bot_status"] = "Waiting..."
+                footer_text = self._turn_prompt(game, game["turn"])
+                embed = self._poker_status_embed(game["ctx"], game, footer_text=footer_text)
+                self._sync_poker_view(game)
+                await self._update_interaction(interaction, embed, view=view)
+                self._record_player_action(user_id, effective_action)
+                if not self._is_pvp(game):
+                    await self._bot_take_turn(interaction, game)
+                else:
+                    finished = await self._maybe_finish_round(interaction, game)
+                    if finished:
+                        game["locked"] = False
+                        return
+                    game["locked"] = False
                 return
 
-        game["turn"] = self._other_player(actor)
-        if not self._is_pvp(game):
-            game["bot_status"] = "Waiting..."
-        footer_text = self._turn_prompt(game, game["turn"])
-        embed = self._poker_status_embed(game["ctx"], game, footer_text=footer_text)
-        self._sync_poker_view(game)
-        await self._update_interaction(interaction, embed, view=view)
-        if not self._is_pvp(game):
-            await self._bot_take_turn(interaction, game)
-        else:
-            game["locked"] = False
+            if effective_action in ("allin", "all-in"):
+                current_balance = self._player_balance(game, actor)
+                if current_balance <= 0:
+                    await interaction.response.send_message("You don't have any RM to go all-in.", ephemeral=True)
+                    game["locked"] = False
+                    return
+                round_key = f"{actor}_round_bet"
+                total_key = f"{actor}_total_bet"
+                max_bet = game.get("max_bet", 0)
+                current_round_bet = game.get(round_key, 0)
+                max_allowed_total = max_bet if max_bet else current_round_bet + current_balance
+                target_total = min(current_round_bet + current_balance, max_allowed_total)
+                amount_to_allin = target_total - current_round_bet
+                if amount_to_allin <= 0:
+                    await interaction.response.send_message(
+                        f"You're already at the max bet of RM {max_bet}.",
+                        ephemeral=True,
+                    )
+                    game["locked"] = False
+                    return
+                if max_bet and target_total >= max_bet and current_balance > amount_to_allin:
+                    game[f"{actor}_allin_capped"] = True
+                self._adjust_player_balance(game, actor, -amount_to_allin)
+                game[total_key] = game.get(total_key, 0) + amount_to_allin
+                game[round_key] = current_round_bet + amount_to_allin
+                game["pot"] = game.get("pot", 0) + amount_to_allin
+                game[f"{actor}_all_in"] = amount_to_allin >= current_balance
+                if game[round_key] > game.get("current_bet", 0):
+                    game["current_bet"] = game[round_key]
+                    game["raise_count"] = game.get("raise_count", 0) + 1
+                    game["awaiting_call"] = self._other_player(actor)
+                else:
+                    game["awaiting_call"] = None
+                game[f"{actor}_acted"] = True
+                game["turn"] = self._other_player(actor)
+                if self._is_pvp(game):
+                    player_name = self._player_display_name(game, actor)
+                    game["bot_status"] = f"Last action: {player_name} went all-in for {amount_to_allin}."
+                else:
+                    game["bot_status"] = "Waiting..."
+                footer_text = self._turn_prompt(game, game["turn"])
+                embed = self._poker_status_embed(game["ctx"], game, footer_text=footer_text)
+                self._sync_poker_view(game)
+                await self._update_interaction(interaction, embed, view=view)
+                self._record_player_action(user_id, effective_action)
+                if not self._is_pvp(game):
+                    await self._bot_take_turn(interaction, game)
+                else:
+                    finished = await self._maybe_finish_round(interaction, game)
+                    if finished:
+                        game["locked"] = False
+                        return
+                    game["locked"] = False
+                return
+
+            if effective_action == "call":
+                amount_to_call = to_call
+                current_balance = self._player_balance(game, actor)
+                if amount_to_call > current_balance:
+                    amount_to_call = current_balance
+                    game[f"{actor}_all_in"] = True
+                if amount_to_call > 0:
+                    round_key = f"{actor}_round_bet"
+                    total_key = f"{actor}_total_bet"
+                    self._adjust_player_balance(game, actor, -amount_to_call)
+                    game[total_key] = game.get(total_key, 0) + amount_to_call
+                    game[round_key] = game.get(round_key, 0) + amount_to_call
+                    game["pot"] = game.get("pot", 0) + amount_to_call
+                game[f"{actor}_acted"] = True
+                game["awaiting_call"] = None
+            elif effective_action == "check":
+                game[f"{actor}_acted"] = True
+            else:
+                await interaction.response.send_message("Invalid action.", ephemeral=True)
+                game["locked"] = False
+                return
+            if self._is_pvp(game):
+                player_name = self._player_display_name(game, actor)
+                if effective_action == "call":
+                    game["bot_status"] = f"Last action: {player_name} called {amount_to_call}."
+                else:
+                    game["bot_status"] = f"Last action: {player_name} checked."
+
+            self._record_player_action(user_id, effective_action)
+            if game.get("bot_acted") and game.get("user_acted") and not game.get("awaiting_call"):
+                finished = await self._maybe_finish_round(interaction, game)
+                if finished:
+                    game["locked"] = False
+                    return
+
+            game["turn"] = self._other_player(actor)
+            if not self._is_pvp(game):
+                game["bot_status"] = "Waiting..."
+            footer_text = self._turn_prompt(game, game["turn"])
+            embed = self._poker_status_embed(game["ctx"], game, footer_text=footer_text)
+            self._sync_poker_view(game)
+            await self._update_interaction(interaction, embed, view=view)
+            if not self._is_pvp(game):
+                await self._bot_take_turn(interaction, game)
+            else:
+                game["locked"] = False
+        except Exception:
+            self.poker_logger.exception(
+                "poker_action_error user_id=%s opponent_id=%s stage=%s action=%s amount=%s",
+                user_id,
+                game.get("opponent_id") if game else None,
+                game.get("stage") if game else None,
+                action,
+                amount,
+            )
+            raise
+
+    @commands.command()
+    async def lottery(self, ctx, *args):
+        action = args[0].lower() if args else "info"
+        entries = self.lottery_state.get("entries", [])
+        if action in ("enter", "join"):
+            if ctx.author.id in entries:
+                embed = discord.Embed(
+                    title="Daily Lottery",
+                    description="You're already in today's lottery.",
+                    color=discord.Color.orange(),
+                )
+                await ctx.send(embed=embed)
+                return
+            balance = self.currency.get_balance(ctx.author.id)
+            if balance < self.LOTTERY_ENTRY_FEE:
+                embed = discord.Embed(
+                    title="Daily Lottery",
+                    description=f"You need RM {self.LOTTERY_ENTRY_FEE} to enter.",
+                    color=discord.Color.red(),
+                )
+                await ctx.send(embed=embed)
+                return
+            self.currency.adjust(ctx.author.id, -self.LOTTERY_ENTRY_FEE)
+            entries.append(ctx.author.id)
+            self.lottery_state["entries"] = entries
+            self._save_lottery_state()
+            pot = self._lottery_pot()
+            embed = discord.Embed(
+                title="Daily Lottery",
+                description=f"Entry confirmed. Current pot: RM {pot}.",
+                color=discord.Color.green(),
+            )
+            await ctx.send(embed=embed)
+            return
+
+        now = datetime.datetime.now(self.LOTTERY_DRAW_TIME.tzinfo)
+        draw_time = self.LOTTERY_DRAW_TIME
+        next_draw = datetime.datetime.combine(now.date(), draw_time)
+        if next_draw.tzinfo is None:
+            next_draw = next_draw.replace(tzinfo=datetime.timezone.utc)
+        if now >= next_draw:
+            next_draw = next_draw + datetime.timedelta(days=1)
+        remaining = next_draw - now
+        hours = int(remaining.total_seconds() // 3600)
+        minutes = int((remaining.total_seconds() % 3600) // 60)
+        pot = self._lottery_pot()
+        count = len(entries)
+        embed = discord.Embed(
+            title="Daily Lottery",
+            description="Enter once per day for a chance to win the full pot.",
+            color=discord.Color.blurple(),
+        )
+        embed.add_field(name="Entry Fee", value=f"RM {self.LOTTERY_ENTRY_FEE}", inline=True)
+        embed.add_field(name="Entries", value=str(count), inline=True)
+        embed.add_field(name="Pot", value=f"RM {pot}", inline=True)
+        embed.add_field(
+            name="Next Draw",
+            value=f"In {hours}h {minutes}m (00:00 UTC)",
+            inline=False,
+        )
+        embed.set_footer(text=f"Use {ctx.prefix}lottery enter to join.")
+        await ctx.send(embed=embed)
 
     @commands.command(aliases=["bal"])
     async def balance(self, ctx):
@@ -1924,6 +2179,7 @@ class Games(commands.Cog):
             )
 
             game = {
+                "hand_id": uuid.uuid4().hex,
                 "deck": deck,
                 "user_cards": user_cards,
                 "bot_cards": bot_cards,
@@ -1972,7 +2228,13 @@ class Games(commands.Cog):
                 self.poker_games[opponent.id] = game
             footer = self._turn_prompt(game, game["turn"])
             embed = self._poker_status_embed(ctx, game, footer_text=footer)
-            view = PokerView(self, ctx, user_id, opponent_id=opponent.id if opponent else None)
+            view = PokerView(
+                self,
+                ctx,
+                user_id,
+                opponent_id=opponent.id if opponent else None,
+                hand_id=game["hand_id"],
+            )
             game["view"] = view
             self._sync_poker_view(game)
             message = await ctx.send(embed=embed, view=view)
