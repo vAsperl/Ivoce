@@ -512,12 +512,9 @@ class Games(commands.Cog):
         if now < next_draw:
             return
         today_key = self._lottery_today_key()
-        entries = self.lottery_state.get("entries", [])
         if self.lottery_state.get("last_draw") != today_key:
             await self._run_lottery_draw()
             return
-        if entries:
-            await self._run_lottery_draw(force=True)
 
     @_lottery_daily_draw.before_loop
     async def _lottery_daily_draw_before(self):
@@ -1723,10 +1720,6 @@ class Games(commands.Cog):
             today_key = self._lottery_today_key()
             if self.lottery_state.get("last_draw") != today_key:
                 await self._run_lottery_draw(announce_channel=ctx.channel)
-                entries = self.lottery_state.get("entries", [])
-            elif entries:
-                # Stale state: entries exist even though today's draw is marked complete.
-                await self._run_lottery_draw(announce_channel=ctx.channel, force=True)
                 entries = self.lottery_state.get("entries", [])
         if now >= next_draw:
             next_draw = next_draw + datetime.timedelta(days=1)
