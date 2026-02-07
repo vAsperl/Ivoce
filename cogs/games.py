@@ -11,6 +11,21 @@ import re
 import datetime
 import uuid
 
+LOTTERY_TZ = datetime.timezone(datetime.timedelta(hours=8))
+
+
+def _parse_lottery_draw_time(value):
+    if not value:
+        return datetime.time(hour=0, minute=0, tzinfo=LOTTERY_TZ)
+    match = re.match(r"^\s*(\d{1,2})\s*:\s*(\d{1,2})\s*$", str(value))
+    if not match:
+        return datetime.time(hour=0, minute=0, tzinfo=LOTTERY_TZ)
+    hour = int(match.group(1))
+    minute = int(match.group(2))
+    if hour < 0 or hour > 23 or minute < 0 or minute > 59:
+        return datetime.time(hour=0, minute=0, tzinfo=LOTTERY_TZ)
+    return datetime.time(hour=hour, minute=minute, tzinfo=LOTTERY_TZ)
+
 
 class CurrencyManager:
     def __init__(self, path, start_balance=100):
@@ -227,9 +242,8 @@ class Games(commands.Cog):
     DAILY_COOLDOWN = 60 * 60 * 24
     LOTTERY_ENTRY_FEE = 100
     LOTTERY_BASE_POT = 50000
-    LOTTERY_DRAW_TIME = datetime.time(
-        hour=0, minute=0, tzinfo=datetime.timezone(datetime.timedelta(hours=8))
-    )
+    LOTTERY_DRAW_TIME = _parse_lottery_draw_time(os.getenv("LOTTERY_DRAW_TIME", "00:00"))
+    LOTTERY_LAST_WINNER_WEIGHT = float(os.getenv("LOTTERY_LAST_WINNER_WEIGHT", "0.5"))
     CATEGORY_NAMES = [
         "High Card",
         "Pair",
@@ -332,7 +346,14 @@ class Games(commands.Cog):
             pass
 
     def _default_lottery_state(self):
-        return {"entries": [], "last_draw": None, "house_earnings": 0}
+        return {
+            "entries": [],
+            "last_draw": None,
+            "house_earnings": 0,
+            "last_draw_empty": False,
+            "last_channel_id": None,
+            "last_winner": None,
+        }
 
     def _load_lottery_state(self):
         if not os.path.exists(self.lottery_path):
@@ -356,14 +377,30 @@ class Games(commands.Cog):
         last_draw = data.get("last_draw")
         if not isinstance(last_draw, str):
             last_draw = None
+        last_draw_empty = bool(data.get("last_draw_empty", False))
+        last_winner = data.get("last_winner")
+        if not isinstance(last_winner, int):
+            try:
+                last_winner = int(last_winner)
+            except (TypeError, ValueError):
+                last_winner = None
         try:
             house_earnings = int(data.get("house_earnings", 0))
         except (TypeError, ValueError):
             house_earnings = 0
+        last_channel_id = data.get("last_channel_id")
+        if not isinstance(last_channel_id, int):
+            try:
+                last_channel_id = int(last_channel_id)
+            except (TypeError, ValueError):
+                last_channel_id = None
         return {
             "entries": normalized_entries,
             "last_draw": last_draw,
             "house_earnings": max(0, house_earnings),
+            "last_draw_empty": last_draw_empty,
+            "last_channel_id": last_channel_id,
+            "last_winner": last_winner,
         }
 
     def _save_lottery_state(self):
@@ -377,7 +414,7 @@ class Games(commands.Cog):
             pass
 
     def _lottery_today_key(self):
-        return datetime.datetime.now(datetime.timezone.utc).date().isoformat()
+        return datetime.datetime.now(LOTTERY_TZ).date().isoformat()
 
     def _lottery_pot(self):
         entries = self.lottery_state.get("entries", [])
@@ -395,36 +432,92 @@ class Games(commands.Cog):
             except Exception:
                 self.poker_logger.exception("house_earnings_add logging failed")
 
-    async def _run_lottery_draw(self):
+    async def _run_lottery_draw(self, *, announce_channel=None, force=False):
         today = self._lottery_today_key()
-        if self.lottery_state.get("last_draw") == today:
-            return
+        already_drawn = self.lottery_state.get("last_draw") == today
+        last_draw_empty = bool(self.lottery_state.get("last_draw_empty", False))
+        if not force and already_drawn and not last_draw_empty:
+            return {"drawn": False, "reason": "already_drawn", "winner_id": None, "pot": None}
         entries = self.lottery_state.get("entries", [])
+        if not force and already_drawn and last_draw_empty and not entries:
+            return {"drawn": False, "reason": "already_drawn_empty", "winner_id": None, "pot": None}
         if not entries:
             self.lottery_state["last_draw"] = today
+            self.lottery_state["last_draw_empty"] = True
             self._save_lottery_state()
-            return
-        winner_id = random.choice(entries)
+            return {"drawn": False, "reason": "no_entries", "winner_id": None, "pot": None}
+        last_winner = self.lottery_state.get("last_winner")
+        if last_winner in entries and len(entries) > 1:
+            weight = max(0.0, min(1.0, self.LOTTERY_LAST_WINNER_WEIGHT))
+            weights = [weight if entry == last_winner else 1.0 for entry in entries]
+            winner_id = random.choices(entries, weights=weights, k=1)[0]
+        else:
+            winner_id = random.choice(entries)
         pot = self._lottery_pot()
         self.currency.adjust(winner_id, pot)
         self.lottery_state["entries"] = []
         self.lottery_state["house_earnings"] = 0
         self.lottery_state["last_draw"] = today
+        self.lottery_state["last_draw_empty"] = False
+        self.lottery_state["last_winner"] = winner_id
         self._save_lottery_state()
         channel_id = os.getenv("LOTTERY_ANNOUNCE_CHANNEL")
-        if channel_id:
+        target_channel = announce_channel
+        if target_channel is None and channel_id:
             try:
-                channel = self.bot.get_channel(int(channel_id))
-                if channel is None:
-                    channel = await self.bot.fetch_channel(int(channel_id))
-                if channel:
-                    await channel.send(f"Daily lottery winner: <@{winner_id}> wins RM {pot}!")
+                target_channel = self.bot.get_channel(int(channel_id))
+                if target_channel is None:
+                    target_channel = await self.bot.fetch_channel(int(channel_id))
+            except Exception:
+                target_channel = None
+        if target_channel is None:
+            last_channel_id = self.lottery_state.get("last_channel_id")
+            if last_channel_id:
+                try:
+                    target_channel = self.bot.get_channel(int(last_channel_id))
+                    if target_channel is None:
+                        target_channel = await self.bot.fetch_channel(int(last_channel_id))
+                except Exception:
+                    target_channel = None
+        if target_channel:
+            try:
+                winner_user = self.bot.get_user(int(winner_id))
+                if winner_user is None:
+                    winner_user = await self.bot.fetch_user(int(winner_id))
+                balance = self.currency.get_balance(winner_id)
+                embed = discord.Embed(
+                    title="Daily Lottery Winner",
+                    description=f"<@{winner_id}> wins RM {pot}!",
+                    color=discord.Color.gold(),
+                )
+                if winner_user:
+                    embed.set_thumbnail(url=winner_user.display_avatar.url)
+                    embed.set_author(
+                        name=str(winner_user),
+                        icon_url=winner_user.display_avatar.url,
+                    )
+                embed.add_field(name="Current Balance", value=f"RM {self._format_rm(balance)}", inline=False)
+                await target_channel.send(embed=embed)
             except Exception:
                 self.poker_logger.exception("lottery_announce_failed channel_id=%s", channel_id)
+        return {"drawn": True, "reason": "drawn", "winner_id": winner_id, "pot": pot}
 
-    @tasks.loop(time=LOTTERY_DRAW_TIME)
+    @tasks.loop(minutes=1)
     async def _lottery_daily_draw(self):
-        await self._run_lottery_draw()
+        now = datetime.datetime.now(self.LOTTERY_DRAW_TIME.tzinfo)
+        draw_time = self.LOTTERY_DRAW_TIME
+        next_draw = datetime.datetime.combine(now.date(), draw_time)
+        if next_draw.tzinfo is None:
+            next_draw = next_draw.replace(tzinfo=datetime.timezone.utc)
+        if now < next_draw:
+            return
+        today_key = self._lottery_today_key()
+        entries = self.lottery_state.get("entries", [])
+        if self.lottery_state.get("last_draw") != today_key:
+            await self._run_lottery_draw()
+            return
+        if entries:
+            await self._run_lottery_draw(force=True)
 
     @_lottery_daily_draw.before_loop
     async def _lottery_daily_draw_before(self):
@@ -1587,6 +1680,8 @@ class Games(commands.Cog):
     async def lottery(self, ctx, *args):
         action = args[0].lower() if args else "info"
         entries = self.lottery_state.get("entries", [])
+        self.lottery_state["last_channel_id"] = ctx.channel.id
+        self._save_lottery_state()
         if action in ("enter", "join"):
             if ctx.author.id in entries:
                 embed = discord.Embed(
@@ -1608,6 +1703,7 @@ class Games(commands.Cog):
             self.currency.adjust(ctx.author.id, -self.LOTTERY_ENTRY_FEE)
             entries.append(ctx.author.id)
             self.lottery_state["entries"] = entries
+            self.lottery_state["last_channel_id"] = ctx.channel.id
             self._save_lottery_state()
             pot = self._lottery_pot()
             embed = discord.Embed(
@@ -1623,6 +1719,15 @@ class Games(commands.Cog):
         next_draw = datetime.datetime.combine(now.date(), draw_time)
         if next_draw.tzinfo is None:
             next_draw = next_draw.replace(tzinfo=datetime.timezone.utc)
+        if now >= next_draw:
+            today_key = self._lottery_today_key()
+            if self.lottery_state.get("last_draw") != today_key:
+                await self._run_lottery_draw(announce_channel=ctx.channel)
+                entries = self.lottery_state.get("entries", [])
+            elif entries:
+                # Stale state: entries exist even though today's draw is marked complete.
+                await self._run_lottery_draw(announce_channel=ctx.channel, force=True)
+                entries = self.lottery_state.get("entries", [])
         if now >= next_draw:
             next_draw = next_draw + datetime.timedelta(days=1)
         remaining = next_draw - now
@@ -1640,11 +1745,86 @@ class Games(commands.Cog):
         embed.add_field(name="Pot", value=f"RM {pot}", inline=True)
         embed.add_field(
             name="Next Draw",
-            value=f"In {hours}h {minutes}m (00:00 UTC)",
+            value=f"In {hours}h {minutes}m ({draw_time.strftime('%H:%M')} UTC+8)",
             inline=False,
         )
         embed.set_footer(text=f"Use {ctx.prefix}lottery enter to join.")
         await ctx.send(embed=embed)
+
+    @commands.command()
+    async def lotterydebug(self, ctx, *args):
+        if ctx.author.id != 255365914898333707:
+            embed = discord.Embed(
+                title="Access denied",
+                description="You don't have access to this command.",
+                color=discord.Color.red(),
+            )
+            await ctx.send(embed=embed)
+            return
+        action = args[0].lower() if args else "draw"
+        if action in ("info", "status"):
+            entries = self.lottery_state.get("entries", [])
+            pot = self._lottery_pot()
+            last_draw = self.lottery_state.get("last_draw")
+            now = datetime.datetime.now(self.LOTTERY_DRAW_TIME.tzinfo)
+            draw_time = self.LOTTERY_DRAW_TIME
+            next_draw = datetime.datetime.combine(now.date(), draw_time)
+            if next_draw.tzinfo is None:
+                next_draw = next_draw.replace(tzinfo=datetime.timezone.utc)
+            if now >= next_draw:
+                next_draw = next_draw + datetime.timedelta(days=1)
+            remaining = next_draw - now
+            hours = int(remaining.total_seconds() // 3600)
+            minutes = int((remaining.total_seconds() % 3600) // 60)
+            embed = discord.Embed(
+                title="Lottery Debug Status",
+                color=discord.Color.blurple(),
+            )
+            embed.add_field(name="Entries", value=str(len(entries)), inline=True)
+            embed.add_field(name="Pot", value=f"RM {pot}", inline=True)
+            embed.add_field(name="Last Draw Key", value=str(last_draw), inline=False)
+            embed.add_field(
+                name="Last Draw Empty",
+                value=str(bool(self.lottery_state.get("last_draw_empty", False))),
+                inline=False,
+            )
+            embed.add_field(
+                name="Next Draw",
+                value=f"In {hours}h {minutes}m",
+                inline=False,
+            )
+            await ctx.send(embed=embed)
+            return
+        if action in ("draw", "run", "force"):
+            force = action == "force" or (len(args) > 1 and args[1].lower() in ("force", "override"))
+            last_draw_before = self.lottery_state.get("last_draw")
+            entries_before = len(self.lottery_state.get("entries", []))
+            pot_before = self._lottery_pot()
+            if force:
+                self.lottery_state["last_draw"] = None
+            result = await self._run_lottery_draw(announce_channel=ctx.channel, force=force)
+            entries_after = len(self.lottery_state.get("entries", []))
+            last_draw_after = self.lottery_state.get("last_draw")
+            embed = discord.Embed(
+                title="Lottery Debug Draw",
+                description="Manual draw attempted.",
+                color=discord.Color.green(),
+            )
+            embed.add_field(name="Result", value=str(result.get("reason")), inline=True)
+            embed.add_field(name="Force", value=str(bool(force)), inline=True)
+            embed.add_field(name="Entries Before", value=str(entries_before), inline=True)
+            embed.add_field(name="Entries After", value=str(entries_after), inline=True)
+            embed.add_field(name="Pot Before", value=f"RM {pot_before}", inline=True)
+            winner_id = result.get("winner_id")
+            if winner_id:
+                embed.add_field(name="Winner", value=f"<@{winner_id}>", inline=True)
+            if result.get("pot") is not None:
+                embed.add_field(name="Pot Paid", value=f"RM {result.get('pot')}", inline=True)
+            embed.add_field(name="Last Draw Before", value=str(last_draw_before), inline=False)
+            embed.add_field(name="Last Draw After", value=str(last_draw_after), inline=False)
+            await ctx.send(embed=embed)
+            return
+        await ctx.send("Usage: lotterydebug [status|draw|force]")
 
     @commands.command(aliases=["bal"])
     async def balance(self, ctx):

@@ -5,7 +5,7 @@ import random
 import time
 
 import discord
-from discord.ext import commands
+from discord.ext import commands, tasks
 from collections import deque
 from datetime import datetime, timezone
 from dataclasses import dataclass
@@ -17,6 +17,11 @@ except ModuleNotFoundError:  # pragma: no cover - optional dependency
     pomice = None
 
 from cogs.games import CurrencyManager
+
+
+def _env_str(name, default):
+    value = os.getenv(name, default)
+    return value if value is not None else default
 
 
 @dataclass
@@ -392,6 +397,11 @@ class Music(commands.Cog):
         self.play_reward_min_duration = _env_int("MUSIC_REWARD_MIN_SECONDS", 60)
         self.play_reward_repeat_limit = _env_int("MUSIC_REWARD_REPEAT_LIMIT", 3)
         self.play_reward_streaks = {}
+        self.play_reward_streaks_path = _env_str(
+            "MUSIC_REWARD_STREAKS_FILE",
+            "data/music_reward_streaks.json",
+        )
+        self._load_play_reward_streaks()
         self.play_reward_batch_size = _env_int("MUSIC_REWARD_BATCH_SIZE", 5)
         self.play_reward_batch_amount = _env_int("MUSIC_REWARD_BATCH_AMOUNT", 50)
         self.play_reward_counts = {}
@@ -430,6 +440,55 @@ class Music(commands.Cog):
                 region=region,
             ))
         return specs
+
+    def _load_play_reward_streaks(self):
+        path = self.play_reward_streaks_path
+        if not path or not os.path.exists(path):
+            self.play_reward_streaks = {}
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+        except (json.JSONDecodeError, OSError):
+            self.play_reward_streaks = {}
+            return
+        if not isinstance(data, dict):
+            self.play_reward_streaks = {}
+            return
+        normalized = {}
+        for user_id, streak in data.items():
+            if not isinstance(streak, dict):
+                continue
+            key = streak.get("key")
+            count = streak.get("count")
+            if not isinstance(key, str):
+                continue
+            try:
+                count_value = int(count)
+            except (TypeError, ValueError):
+                continue
+            if count_value <= 0:
+                continue
+            try:
+                user_key = int(user_id)
+            except (TypeError, ValueError):
+                continue
+            normalized[user_key] = {"key": key, "count": count_value}
+        self.play_reward_streaks = normalized
+
+    def _save_play_reward_streaks(self):
+        path = self.play_reward_streaks_path
+        if not path:
+            return
+        try:
+            dir_path = os.path.dirname(path)
+            if dir_path:
+                os.makedirs(dir_path, exist_ok=True)
+            data = {str(user_id): streak for user_id, streak in self.play_reward_streaks.items()}
+            with open(path, "w", encoding="utf-8") as fh:
+                json.dump(data, fh)
+        except OSError:
+            pass
 
     async def start_pomice_nodes(self):
         if self._pomice_nodes_started:
@@ -1226,6 +1285,52 @@ class Music(commands.Cog):
         view.sync_play_pause(ctx.guild.voice_client if ctx.guild else None)
         await self._send_now_playing_embed(ctx.channel, entry, state, embed, view, replace=True)
 
+    @commands.command()
+    async def vcdebug(self, ctx):
+        if ctx.author.id != 255365914898333707:
+            embed = self._build_status_embed(
+                "Access denied",
+                "You don't have access to this command.",
+                color=discord.Color.red(),
+                footer="Voice debug",
+            )
+            await ctx.send(embed=embed)
+            return
+        voice_client = ctx.guild.voice_client if ctx.guild else None
+        if not voice_client or not voice_client.channel:
+            embed = self._build_status_embed(
+                "VC Debug",
+                "Bot is not connected to a voice channel.",
+                color=discord.Color.orange(),
+                footer="Voice debug",
+            )
+            await ctx.send(embed=embed)
+            return
+        channel = voice_client.channel
+        members = list(channel.members)
+        human_members = [m for m in members if not m.bot]
+        bot_members = [m for m in members if m.bot]
+        embed = self._build_status_embed(
+            "VC Debug",
+            f"Channel: {channel.name} ({channel.id})",
+            color=discord.Color.blurple(),
+            footer="Voice debug",
+        )
+        embed.add_field(name="Total Members", value=str(len(members)), inline=True)
+        embed.add_field(name="Humans", value=str(len(human_members)), inline=True)
+        embed.add_field(name="Bots", value=str(len(bot_members)), inline=True)
+        if human_members:
+            names = ", ".join(m.display_name for m in human_members[:20])
+            if len(human_members) > 20:
+                names += " ..."
+            embed.add_field(name="Humans List", value=names, inline=False)
+        if bot_members:
+            names = ", ".join(m.display_name for m in bot_members[:20])
+            if len(bot_members) > 20:
+                names += " ..."
+            embed.add_field(name="Bots List", value=names, inline=False)
+        await ctx.send(embed=embed)
+
     async def _start_next_in_queue(self, state, guild):
         await self._reset_skip_vote(state)
         async with state.lock:
@@ -1378,6 +1483,7 @@ class Music(commands.Cog):
         else:
             streak = {"key": track_key, "count": 1}
         self.play_reward_streaks[requester.id] = streak
+        self._save_play_reward_streaks()
         if streak["count"] > self.play_reward_repeat_limit:
             return
         currency = self._get_currency_manager()
@@ -1529,6 +1635,26 @@ class Music(commands.Cog):
     @commands.Cog.listener()
     async def on_ready(self):
         await self.start_pomice_nodes()
+        if not self._empty_vc_watchdog.is_running():
+            self._empty_vc_watchdog.start()
+
+    @tasks.loop(minutes=1)
+    async def _empty_vc_watchdog(self):
+        for guild in self.bot.guilds:
+            voice_client = guild.voice_client
+            if not voice_client or not voice_client.channel:
+                continue
+            if not self._should_leave_voice(voice_client):
+                continue
+            state = self._get_state(guild)
+            if self._vc_is_playing(voice_client) or self._vc_is_paused(voice_client):
+                if not state.empty_voice_task or state.empty_voice_task.done():
+                    self._schedule_empty_voice_shutdown(guild, state)
+                continue
+            try:
+                await voice_client.disconnect()
+            except (discord.HTTPException, discord.Forbidden):
+                pass
 
     @commands.Cog.listener()
     async def on_pomice_track_end(self, player, track, reason):
