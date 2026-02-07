@@ -926,6 +926,7 @@ class Music(commands.Cog):
                 if not state or state.current_entry is not entry:
                     break
                 await self._refresh_now_playing_embed(entry, state)
+                await self._maybe_autoadvance_if_stopped(entry, state)
         except asyncio.CancelledError:
             pass
         finally:
@@ -938,6 +939,49 @@ class Music(commands.Cog):
         if task and not task.done():
             return
         entry['timestamp_task'] = asyncio.create_task(self._timestamp_update_loop(entry, state))
+
+    def _update_stop_tracker(self, entry, voice_client):
+        if not entry or not voice_client:
+            return
+        if self._vc_is_playing(voice_client) or self._vc_is_paused(voice_client):
+            entry.pop('last_stop_time', None)
+            return
+        entry.setdefault('last_stop_time', time.time())
+
+    async def _maybe_autoadvance_if_stopped(self, entry, state):
+        if not entry or not state or state.current_entry is not entry:
+            return
+        if entry.get('_auto_advancing'):
+            return
+        guild = entry.get('guild')
+        voice_client = guild.voice_client if guild else None
+        if not voice_client:
+            return
+        self._update_stop_tracker(entry, voice_client)
+        if self._vc_is_playing(voice_client) or self._vc_is_paused(voice_client):
+            return
+
+        metadata = entry.get('metadata') or {}
+        duration = metadata.get('duration')
+        elapsed = self._get_elapsed_time(entry)
+        if duration and elapsed is not None and elapsed + 2 < duration:
+            return
+
+        if duration is None:
+            last_stop = entry.get('last_stop_time')
+            if last_stop is None:
+                return
+            if time.time() - last_stop < 10:
+                return
+            if elapsed is not None and elapsed < 30:
+                return
+
+        entry['_auto_advancing'] = True
+        try:
+            self.logger.info("Auto-advancing track after stop: %s", entry.get('title') or entry.get('url'))
+            await self._complete_entry(state, entry)
+        finally:
+            entry.pop('_auto_advancing', None)
 
     def _cancel_now_playing_timestamp_updates(self, entry):
         if not entry:
