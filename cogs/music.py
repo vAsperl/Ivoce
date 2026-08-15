@@ -548,11 +548,9 @@ class Music(commands.Cog):
     def _should_leave_voice(self, voice_client):
         if voice_client is None or voice_client.channel is None:
             return False
-        members = [
-            member for member in voice_client.channel.members
-            if member.id != voice_client.user.id and not member.bot
-        ]
-        return len(members) == 0
+        return not any(
+            not member.bot for member in voice_client.channel.members
+        )
 
     def _voice_listener_count(self, voice_client):
         if voice_client is None or voice_client.channel is None:
