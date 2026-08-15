@@ -11,6 +11,8 @@ import re
 import datetime
 import uuid
 
+from daily_logs import DailyLogHandler
+
 LOTTERY_TZ = datetime.timezone(datetime.timedelta(hours=8))
 
 
@@ -261,13 +263,17 @@ class Games(commands.Cog):
         self.bot = bot
         self.poker_logger = logging.getLogger("poker")
         if not self.poker_logger.handlers:
-            handler = logging.FileHandler(filename="poker.log", encoding="utf-8", mode="a")
+            project_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            log_root = os.getenv("LOG_DIR", os.path.join(project_dir, "logs"))
+            handler = DailyLogHandler(log_root, "poker")
             handler.setFormatter(
-                logging.Formatter("[%(asctime)s] [%(levelname)s] %(message)s")
+                logging.Formatter(
+                    "[%(asctime)s] [%(levelname)s] [%(name)s] %(message)s"
+                )
             )
             self.poker_logger.addHandler(handler)
             self.poker_logger.setLevel(logging.INFO)
-            self.poker_logger.propagate = False
+            self.poker_logger.propagate = True
         data_file = os.getenv("GAMES_DATAFILE", "games_currency.json")
         self.currency = CurrencyManager(data_file, start_balance=100)
         self.lottery_path = os.getenv("LOTTERY_DATAFILE", "data/lottery.json")
