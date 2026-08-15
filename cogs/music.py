@@ -18,11 +18,6 @@ except ModuleNotFoundError:  # pragma: no cover - optional dependency
     pomice = None
 
 from cogs.games import CurrencyManager
-from resolvers.japaneseasmr import (
-    JapaneseASMRResolverError,
-    error_logger as japaneseasmr_error_logger,
-    resolve as resolve_japaneseasmr,
-)
 
 
 def _env_str(name, default):
@@ -31,7 +26,7 @@ def _env_str(name, default):
 
 
 @dataclass
-class LavalinkNodeSpec:
+class PomiceNodeSpec:
     identifier: str
     host: str
     port: int
@@ -58,27 +53,27 @@ class TransportControls(discord.ui.View):
             return None
         return interaction.guild.voice_client
 
-    def _is_lavalink_voice_client(self, voice_client):
-        return self.music_cog._is_lavalink_player(voice_client)
+    def _is_pomice_voice_client(self, voice_client):
+        return self.music_cog._is_pomice_player(voice_client)
 
     def _is_paused(self, voice_client):
         if not voice_client:
             return False
-        if self._is_lavalink_voice_client(voice_client):
+        if self._is_pomice_voice_client(voice_client):
             return voice_client.is_paused
         return voice_client.is_paused()
 
     def _is_playing(self, voice_client):
         if not voice_client:
             return False
-        if self._is_lavalink_voice_client(voice_client):
+        if self._is_pomice_voice_client(voice_client):
             return voice_client.is_playing
         return voice_client.is_playing()
 
     async def _set_pause_state(self, voice_client, paused):
         if not voice_client:
             return
-        if self._is_lavalink_voice_client(voice_client):
+        if self._is_pomice_voice_client(voice_client):
             await voice_client.set_pause(paused)
             return
         if paused:
@@ -89,7 +84,7 @@ class TransportControls(discord.ui.View):
     async def _stop_voice_client(self, voice_client):
         if not voice_client:
             return
-        if self._is_lavalink_voice_client(voice_client):
+        if self._is_pomice_voice_client(voice_client):
             await voice_client.stop()
         else:
             voice_client.stop()
@@ -159,21 +154,13 @@ class TransportControls(discord.ui.View):
         if listener_count <= 1:
             if requester and interaction.user.id != requester.id:
                 entry['force_reward'] = True
-            entry['skipped'] = True
-            embed = self.music_cog._build_music_skipped_embed(
-                entry,
-                interaction.guild,
-                [interaction.user.id],
-            )
-            await interaction.channel.send(embed=embed)
             try:
                 await self.music_cog._stop_voice_client(vc)
             except Exception:
                 pass
             if state:
                 await self.music_cog._reset_skip_vote(state)
-            if not interaction.response.is_done():
-                await interaction.response.defer()
+            await self._reply(interaction, "Skipped to the next track.")
             return
 
         async with state.lock:
@@ -196,14 +183,15 @@ class TransportControls(discord.ui.View):
         await self.music_cog._set_skip_vote_message(state, interaction, embed, view=view)
 
         if votes >= required:
-            voter_ids = list(state.skip_votes)
-            if requester and any(voter_id != requester.id for voter_id in voter_ids):
+            if requester and any(voter_id != requester.id for voter_id in state.skip_votes):
                 entry['force_reward'] = True
-            entry['skipped'] = True
-            outcome = self.music_cog._build_music_skipped_embed(
+            outcome = self.music_cog._build_skip_vote_embed(
+                votes,
+                required,
+                status="passed",
+                force_skip_cost=force_skip_cost,
+                listener_count=listener_count,
                 entry=entry,
-                guild=interaction.guild,
-                skipper_ids=voter_ids,
             )
             await self.music_cog._set_skip_vote_message(state, interaction, outcome, view=view)
             try:
@@ -212,8 +200,7 @@ class TransportControls(discord.ui.View):
                 pass
             if state:
                 await self.music_cog._reset_skip_vote(state)
-            if not interaction.response.is_done():
-                await interaction.response.defer()
+            await self._reply(interaction, "Skip vote passed. Skipping...")
             return
         if not interaction.response.is_done():
             try:
@@ -317,14 +304,6 @@ class SkipVoteView(discord.ui.View):
         requester = entry.get('requester')
         if requester and interaction.user.id != requester.id:
             entry['force_reward'] = True
-        entry['skipped'] = True
-        embed = self.music_cog._build_music_skipped_embed(
-            entry,
-            interaction.guild,
-            [interaction.user.id],
-            force=True,
-        )
-        await interaction.channel.send(embed=embed)
         try:
             await self.music_cog._stop_voice_client(vc)
         except Exception:
@@ -403,17 +382,18 @@ def _env_flag(name, default=False):
 
 
 class Music(commands.Cog):
-    IDLE_DISCONNECT_DELAY = 10
-    EMPTY_VC_SHUTDOWN_DELAY = 10
+    IDLE_DISCONNECT_DELAY = 15
+    EMPTY_VC_SHUTDOWN_DELAY = 30
 
     def __init__(self, bot):
         self.bot = bot
         self.logger = logging.getLogger('discord.music')
         self.guild_states = {}
-        self.lavalink_nodes = self._load_lavalink_node_specs()
-        self._lavalink_nodes_ready = False
-        self._lavalink_nodes_started = False
-        self.lavalink_player_cls = pomice.Player if pomice else None
+        self.pomice_pool = pomice.NodePool() if pomice else None
+        self.pomice_nodes = self._load_pomice_node_specs()
+        self._pomice_nodes_ready = False
+        self._pomice_nodes_started = False
+        self.pomice_player_cls = pomice.Player if pomice else None
         self.play_reward = _env_int("MUSIC_PLAY_REWARD", 10)
         self.play_reward_min_duration = _env_int("MUSIC_REWARD_MIN_SECONDS", 60)
         self.play_reward_repeat_limit = _env_int("MUSIC_REWARD_REPEAT_LIMIT", 3)
@@ -428,49 +408,9 @@ class Music(commands.Cog):
         self.play_reward_counts = {}
         self.disable_loop_rewards = _env_flag("DISABLE_LOOP_REWARDS", default=False)
         self.force_skip_base_cost = _env_int("MUSIC_FORCE_SKIP_BASE_COST", 100)
-        self.settings_path = _env_str("MUSIC_SETTINGS_FILE", "data/music_settings.json")
-        self.guild_settings = self._load_guild_settings()
 
-    def _load_guild_settings(self):
-        try:
-            with open(self.settings_path, "r", encoding="utf-8") as fh:
-                data = json.load(fh)
-        except (FileNotFoundError, OSError, json.JSONDecodeError):
-            return {}
-        if not isinstance(data, dict):
-            return {}
-        return {
-            str(guild_id): {"auto_leave": settings.get("auto_leave", True) is True}
-            for guild_id, settings in data.items()
-            if isinstance(settings, dict)
-        }
-
-    def _save_guild_settings(self):
-        try:
-            directory = os.path.dirname(self.settings_path)
-            if directory:
-                os.makedirs(directory, exist_ok=True)
-            with open(self.settings_path, "w", encoding="utf-8") as fh:
-                json.dump(self.guild_settings, fh, indent=2, sort_keys=True)
-        except OSError as exc:
-            self.logger.error("Could not save music settings: %s", exc, exc_info=True)
-
-    def _auto_leave_enabled(self, guild):
-        if guild is None:
-            return True
-        settings = self.guild_settings.get(str(guild.id), {})
-        return settings.get("auto_leave", True)
-
-    def _set_auto_leave(self, guild, enabled):
-        settings = self.guild_settings.setdefault(str(guild.id), {})
-        settings["auto_leave"] = bool(enabled)
-        self._save_guild_settings()
-
-    def _load_lavalink_node_specs(self):
-        raw = os.getenv("WAVELINK_NODES", "").strip()
-        if not raw:
-            # Preserve existing deployments while allowing the clearer new name.
-            raw = os.getenv("POMICE_NODES", "").strip()
+    def _load_pomice_node_specs(self):
+        raw = os.getenv("POMICE_NODES", "").strip()
         if not raw:
             return []
         specs = []
@@ -492,7 +432,7 @@ class Music(commands.Cog):
                 port_value = int(port)
             except ValueError:
                 continue
-            specs.append(LavalinkNodeSpec(
+            specs.append(PomiceNodeSpec(
                 identifier=identifier or "MAIN",
                 host=host,
                 port=port_value,
@@ -551,57 +491,50 @@ class Music(commands.Cog):
         except OSError:
             pass
 
-    async def start_lavalink_nodes(self):
-        if self._lavalink_nodes_started:
+    async def start_pomice_nodes(self):
+        if self._pomice_nodes_started:
             return
-        if not pomice or not self.lavalink_nodes:
+        if not self.pomice_pool or not self.pomice_nodes:
             return
-        for spec in self.lavalink_nodes:
-            await pomice.NodePool.create_node(
-                bot=self.bot,
-                host=spec.host,
-                port=spec.port,
-                password=spec.password,
-                identifier=spec.identifier,
-                secure=spec.secure,
-            )
-        self._lavalink_nodes_ready = True
-        self._lavalink_nodes_started = True
+        for spec in self.pomice_nodes:
+            kwargs = {
+                "bot": self.bot,
+                "host": spec.host,
+                "port": spec.port,
+                "password": spec.password,
+                "identifier": spec.identifier,
+                "secure": spec.secure,
+            }
+            if spec.region:
+                kwargs["region"] = spec.region
+            await self.pomice_pool.create_node(**kwargs)
+        self._pomice_nodes_ready = True
+        self._pomice_nodes_started = True
 
-    def _should_use_lavalink(self):
-        return bool(pomice and self.lavalink_nodes and self._lavalink_nodes_ready)
+    def _should_use_pomice(self):
+        return bool(pomice and self.pomice_pool and self.pomice_nodes and self._pomice_nodes_ready)
 
     def _vc_is_playing(self, voice_client):
         if not voice_client:
             return False
-        if self._is_lavalink_player(voice_client):
+        if self._is_pomice_player(voice_client):
             return voice_client.is_playing
         return voice_client.is_playing()
 
     def _vc_is_paused(self, voice_client):
         if not voice_client:
             return False
-        if self._is_lavalink_player(voice_client):
+        if self._is_pomice_player(voice_client):
             return voice_client.is_paused
         return voice_client.is_paused()
 
     async def _stop_voice_client(self, voice_client):
         if not voice_client:
             return
-        if self._is_lavalink_player(voice_client):
+        if self._is_pomice_player(voice_client):
             await voice_client.stop()
         else:
             voice_client.stop()
-
-    async def _pause_voice_client(self, voice_client, paused=True):
-        if not voice_client:
-            return
-        if self._is_lavalink_player(voice_client):
-            await voice_client.set_pause(paused)
-        elif paused:
-            voice_client.pause()
-        else:
-            voice_client.resume()
 
     def _get_state(self, guild):
         if guild is None:
@@ -615,10 +548,9 @@ class Music(commands.Cog):
     def _should_leave_voice(self, voice_client):
         if voice_client is None or voice_client.channel is None:
             return False
-        bot_user_id = self.bot.user.id if self.bot.user else None
         members = [
             member for member in voice_client.channel.members
-            if member.id != bot_user_id and not member.bot
+            if member.id != voice_client.user.id and not member.bot
         ]
         return len(members) == 0
 
@@ -656,29 +588,6 @@ class Music(commands.Cog):
             thumbnail = (entry.get('metadata') or {}).get('thumbnail')
             if thumbnail:
                 embed.set_thumbnail(url=thumbnail)
-        return embed
-
-    def _build_music_skipped_embed(self, entry, guild, skipper_ids, force=False):
-        description = self._format_queue_entry_title(entry) if entry else "Unknown track"
-        embed = discord.Embed(
-            title="Music Skipped",
-            description=description,
-            color=discord.Color.orange(),
-        )
-        unique_ids = list(dict.fromkeys(skipper_ids))
-        names = []
-        for user_id in unique_ids:
-            member = guild.get_member(user_id) if guild else None
-            names.append(member.mention if member else f"<@{user_id}>")
-        embed.add_field(
-            name="Skipped by" if len(names) == 1 else "Skipped by voters",
-            value="\n".join(names) or "Unknown user",
-            inline=False,
-        )
-        thumbnail = ((entry or {}).get('metadata') or {}).get('thumbnail')
-        if thumbnail:
-            embed.set_thumbnail(url=thumbnail)
-        embed.set_footer(text="Force skip" if force else "Moving to the next track")
         return embed
 
     def _build_skip_vote_view(self, state, force_skip_cost):
@@ -722,8 +631,6 @@ class Music(commands.Cog):
                 pass
 
     async def _maybe_disconnect_if_empty(self, guild):
-        if not self._auto_leave_enabled(guild):
-            return
         voice_client = guild.voice_client
         if voice_client and self._should_leave_voice(voice_client):
             try:
@@ -752,8 +659,6 @@ class Music(commands.Cog):
             return
         self._cancel_idle_disconnect(state)
         self._cancel_empty_voice_shutdown(state)
-        if not self._auto_leave_enabled(guild):
-            return
 
         async def _task():
             try:
@@ -777,38 +682,28 @@ class Music(commands.Cog):
         if not guild or not state:
             return
         async with state.lock:
+            pending_entries = list(state.queue)
             state.queue.clear()
             current_entry = state.current_entry
             state.current_entry = None
             state.is_playing = False
-            # Prevent the Pomice track-end event from starting another queue
-            # or cancelling this shutdown while stop/disconnect is in flight.
-            state.manual_disconnect = True
         if current_entry:
             current_entry['stopped_due_to_empty_vc'] = True
             self._cancel_now_playing_timestamp_updates(current_entry)
         voice_client = guild.voice_client
         if voice_client:
-            channel_name = getattr(voice_client.channel, "name", "unknown")
+            if self._vc_is_playing(voice_client):
+                voice_client.stop()
             try:
-                if self._vc_is_playing(voice_client) or self._vc_is_paused(voice_client):
-                    await self._stop_voice_client(voice_client)
                 await voice_client.disconnect()
-                self.logger.info(
-                    "Left empty voice channel %s in guild %s.",
-                    channel_name,
-                    guild.name,
-                )
-            except Exception as exc:
-                self.logger.warning("Could not leave empty voice channel: %s", exc)
+            except (discord.HTTPException, discord.Forbidden):
+                pass
 
     def _schedule_empty_voice_shutdown(self, guild, state):
         if not guild or not state:
             return
         self._cancel_idle_disconnect(state)
         self._cancel_empty_voice_shutdown(state)
-        if not self._auto_leave_enabled(guild):
-            return
 
         async def _task():
             try:
@@ -1213,53 +1108,33 @@ class Music(commands.Cog):
             return
         await self._safe_delete_message(ctx.message)
 
-        resolved_metadata = None
-        try:
-            japaneseasmr = await resolve_japaneseasmr(url)
-        except JapaneseASMRResolverError as exc:
-            japaneseasmr_error_logger.exception(
-                "Failed to resolve JapaneseASMR URL %s: %s", url, exc
-            )
-            await ctx.send(
-                "Unable to resolve that JapaneseASMR page. The error was written to today's error log."
-            )
-            return
-        if japaneseasmr:
-            resolved_metadata = {
-                'title': japaneseasmr.title,
-                'webpage_url': japaneseasmr.webpage_url,
-                'url': japaneseasmr.stream_url,
-                'thumbnail': japaneseasmr.thumbnail,
-                'uploader': 'JapaneseASMR',
-            }
-            url = japaneseasmr.stream_url
-
         base_entry = {
             'url': url,
             'requester': ctx.author,
             'guild': ctx.guild,
             'voice_channel': voice_channel,
             'text_channel': ctx.channel,
-            'title': resolved_metadata.get('title') if resolved_metadata else None,
-            'metadata': resolved_metadata,
+            'title': None,
+            'metadata': None,
             'loading_message': None,
             'state': None,
         }
         entries = []
-        results = await self._resolve_lavalink_results(url)
+        results = await self._resolve_pomice_results(url, ctx)
         playlist = results if pomice and isinstance(results, pomice.Playlist) else None
         if playlist and getattr(playlist, "tracks", None):
             entries = [self._build_entry_from_track(base_entry, track) for track in playlist.tracks]
         else:
             entry = dict(base_entry)
-            lavalink_track = None
+            pomice_track = None
             if results is not None:
-                lavalink_track = self._extract_lavalink_track(results)
+                pomice_track = self._extract_pomice_track(results)
             else:
-                lavalink_track = await self._resolve_lavalink_track(entry)
-            if lavalink_track:
-                entry['lavalink_track'] = lavalink_track
-                self._apply_lavalink_track_metadata(entry, lavalink_track)
+                pomice_track = await self._resolve_pomice_track(entry, ctx)
+            if pomice_track:
+                entry['pomice_track'] = pomice_track
+                if not entry.get('metadata'):
+                    self._apply_pomice_track_metadata(entry, pomice_track)
             entries = [entry]
 
         state = self._get_state(ctx.guild)
@@ -1346,7 +1221,7 @@ class Music(commands.Cog):
         if ctx.voice_client:
             if self._vc_is_playing(ctx.voice_client) or self._vc_is_paused(ctx.voice_client):
                 self.logger.info("Stopping playback.")
-                if self._is_lavalink_player(ctx.voice_client):
+                if self._is_pomice_player(ctx.voice_client):
                     await ctx.voice_client.stop()
                 else:
                     ctx.voice_client.stop()
@@ -1392,58 +1267,7 @@ class Music(commands.Cog):
         )
         await ctx.send(embed=embed)
 
-    @commands.command(name="autoleave", aliases=["stayvc"])
-    @commands.guild_only()
-    @commands.has_permissions(administrator=True)
-    async def autoleave(self, ctx, setting: str = None):
-        """Toggle whether the bot leaves an empty voice channel after 10 seconds."""
-        current = self._auto_leave_enabled(ctx.guild)
-        if setting is None:
-            enabled = not current
-        else:
-            normalized = setting.strip().lower()
-            if normalized in {"on", "enable", "enabled", "yes", "true"}:
-                enabled = True
-            elif normalized in {"off", "disable", "disabled", "no", "false"}:
-                enabled = False
-            elif normalized in {"status", "show"}:
-                enabled = current
-            else:
-                await ctx.send(
-                    f"Usage: `{ctx.prefix or '?'}autoleave [on|off|status]`"
-                )
-                return
-
-        is_status_request = setting is not None and normalized in {"status", "show"}
-        if not is_status_request:
-            self._set_auto_leave(ctx.guild, enabled)
-
-        state = self._get_state(ctx.guild)
-        if not enabled:
-            self._cancel_idle_disconnect(state)
-            self._cancel_empty_voice_shutdown(state)
-        elif ctx.guild.voice_client and self._should_leave_voice(ctx.guild.voice_client):
-            self._schedule_empty_voice_shutdown(ctx.guild, state)
-
-        status = "enabled" if enabled else "disabled"
-        detail = (
-            "I will leave empty voice channels after 10 seconds."
-            if enabled
-            else "I will remain in voice channels when everyone leaves."
-        )
-        await ctx.send(f"Automatic voice-channel leaving is **{status}**. {detail}")
-
-    @autoleave.error
-    async def autoleave_error(self, ctx, error):
-        if isinstance(error, commands.MissingPermissions):
-            await ctx.send("Only a server administrator can change automatic voice leaving.")
-            return
-        if isinstance(error, commands.NoPrivateMessage):
-            await ctx.send("This command can only be used in a server.")
-            return
-        raise error
-
-    @commands.command(name="queue", aliases=["q"])
+    @commands.command(name="queue")
     async def queue_list(self, ctx):
         """List the currently playing track plus upcoming songs."""
         state = self._get_state(ctx.guild)
@@ -1452,41 +1276,6 @@ class Music(commands.Cog):
         if state and len(state.queue) > 10:
             view = QueueView(self, state, page=1)
         await ctx.send(embed=embed, view=view)
-
-    @commands.command(name="skip", aliases=["s"])
-    async def skip_command(self, ctx):
-        """Skip the currently playing song."""
-        voice_client = ctx.guild.voice_client if ctx.guild else None
-        if not voice_client or not (
-            self._vc_is_playing(voice_client) or self._vc_is_paused(voice_client)
-        ):
-            await ctx.send("Nothing is currently playing to skip.")
-            return
-
-        state = self._get_state(ctx.guild)
-        entry = state.current_entry
-        if not entry:
-            await ctx.send("Nothing is currently playing to skip.")
-            return
-        entry['skipped'] = True
-        embed = self._build_music_skipped_embed(entry, ctx.guild, [ctx.author.id])
-        await ctx.send(embed=embed)
-        await self._reset_skip_vote(state)
-        await self._stop_voice_client(voice_client)
-
-    @commands.command(name="pause")
-    async def pause_command(self, ctx):
-        """Pause the currently playing song."""
-        voice_client = ctx.guild.voice_client if ctx.guild else None
-        if not voice_client or not self._vc_is_playing(voice_client):
-            if voice_client and self._vc_is_paused(voice_client):
-                await ctx.send("Playback is already paused.")
-            else:
-                await ctx.send("Nothing is currently playing to pause.")
-            return
-
-        await self._pause_voice_client(voice_client, True)
-        await ctx.send("⏸️ Playback paused.")
 
     @commands.command(name="remove")
     async def remove_from_queue(self, ctx, pos: int):
@@ -1604,7 +1393,7 @@ class Music(commands.Cog):
         text_channel = entry['text_channel']
 
         try:
-            await self._play_entry_with_lavalink(entry, state, guild, voice_channel, text_channel)
+            await self._play_entry_with_pomice(entry, state, guild, voice_channel, text_channel)
         except Exception as e:
             self.logger.error(f"An error occurred while handling the queue: {e}", exc_info=True)
             await self._delete_loading_message(entry)
@@ -1614,16 +1403,16 @@ class Music(commands.Cog):
                 pass
             await self._complete_entry(state, entry)
 
-    def _is_lavalink_player(self, voice_client):
-        if not pomice or not self.lavalink_player_cls:
+    def _is_pomice_player(self, voice_client):
+        if not pomice or not self.pomice_player_cls:
             return False
-        return isinstance(voice_client, self.lavalink_player_cls)
+        return isinstance(voice_client, self.pomice_player_cls)
 
-    async def _ensure_lavalink_player_connection(self, guild, voice_channel):
+    async def _ensure_pomice_player_connection(self, guild, voice_channel):
         if not pomice:
             return None
         player = guild.voice_client
-        if player is not None and not self._is_lavalink_player(player):
+        if player is not None and not self._is_pomice_player(player):
             try:
                 await player.disconnect()
             except (discord.HTTPException, discord.Forbidden):
@@ -1635,7 +1424,7 @@ class Music(commands.Cog):
             await player.move_to(voice_channel)
         return player
 
-    def _extract_lavalink_track(self, results):
+    def _extract_pomice_track(self, results):
         if not results:
             return None
         if pomice and isinstance(results, pomice.Playlist):
@@ -1649,25 +1438,25 @@ class Music(commands.Cog):
         entry['url'] = getattr(track, "uri", None) or base_entry['url']
         entry['title'] = getattr(track, "title", None) or entry['url']
         entry['metadata'] = None
-        entry['lavalink_track'] = track
-        self._apply_lavalink_track_metadata(entry, track)
+        entry['pomice_track'] = track
+        self._apply_pomice_track_metadata(entry, track)
         return entry
 
-    async def _play_entry_with_lavalink(self, entry, state, guild, voice_channel, text_channel):
+    async def _play_entry_with_pomice(self, entry, state, guild, voice_channel, text_channel):
         if not pomice:
             raise RuntimeError("Pomice is not available.")
-        player = await self._ensure_lavalink_player_connection(guild, voice_channel)
+        player = await self._ensure_pomice_player_connection(guild, voice_channel)
         if player is None:
-            raise RuntimeError("Unable to connect to Lavalink player.")
-        track = entry.get('lavalink_track')
+            raise RuntimeError("Unable to connect to Pomice player.")
+        track = entry.get('pomice_track')
         if not track:
-            results = await self._search_lavalink(entry['url'])
-            track = self._extract_lavalink_track(results)
+            results = await player.get_tracks(query=entry['url'])
+            track = self._extract_pomice_track(results)
             if track is None:
                 raise RuntimeError("No tracks found for that query.")
-            self._apply_lavalink_track_metadata(entry, track)
-        await player.play(track)
-        entry['lavalink_track'] = track
+            self._apply_pomice_track_metadata(entry, track)
+        await player.play(track=track)
+        entry['pomice_track'] = track
         entry['start_time'] = time.time()
         await self._delete_loading_message(entry)
         embed = self._build_now_playing_embed(entry, len(state.queue), state.loop_mode)
@@ -1678,26 +1467,22 @@ class Music(commands.Cog):
         title = track.title if hasattr(track, "title") else entry.get('title')
         self.logger.info(f"Sent now playing embed for {title}")
 
-    def _apply_lavalink_track_metadata(self, entry, track):
+    def _apply_pomice_track_metadata(self, entry, track):
         if not track:
             return
         title = getattr(track, "title", None)
         uri = getattr(track, "uri", None)
         author = getattr(track, "author", None)
         length = getattr(track, "length", None)
-        thumbnail = (
-            getattr(track, "artwork", None)
-            or getattr(track, "thumbnail", None)
-        )
+        thumbnail = getattr(track, "thumbnail", None)
         entry['title'] = title or entry.get('title')
-        existing_metadata = entry.get('metadata') or {}
         entry['metadata'] = {
             'title': title,
-            'webpage_url': existing_metadata.get('webpage_url') or uri or entry.get('url'),
+            'webpage_url': uri or entry.get('url'),
             'url': uri or entry.get('url'),
             'duration': int(length / 1000) if isinstance(length, (int, float)) and length > 0 else None,
-            'uploader': existing_metadata.get('uploader') or author,
-            'thumbnail': existing_metadata.get('thumbnail') or thumbnail,
+            'uploader': author,
+            'thumbnail': thumbnail,
             'id': getattr(track, "identifier", None),
         }
 
@@ -1785,25 +1570,24 @@ class Music(commands.Cog):
             new_balance,
         )
 
-    async def _search_lavalink(self, query):
-        node = pomice.NodePool.get_node()
-        search_type = None if "://" in query or ":" in query.split(" ", 1)[0] else pomice.SearchType.ytsearch
-        return await node.get_tracks(query, search_type=search_type)
-
-    async def _resolve_lavalink_results(self, url):
-        if not pomice or not self._should_use_lavalink():
+    async def _resolve_pomice_results(self, url, ctx=None):
+        if not pomice or not self._should_use_pomice():
             return None
         try:
-            return await self._search_lavalink(url)
+            node = pomice.NodePool.get_node()
+        except Exception:
+            return None
+        try:
+            return await node.get_tracks(query=url, ctx=ctx)
         except Exception as exc:
-            self.logger.warning("Lavalink track lookup failed for queue metadata: %s", exc)
+            self.logger.warning("Pomice track lookup failed for queue metadata: %s", exc)
             return None
 
-    async def _resolve_lavalink_track(self, entry):
-        results = await self._resolve_lavalink_results(entry['url'])
-        track = self._extract_lavalink_track(results)
+    async def _resolve_pomice_track(self, entry, ctx=None):
+        results = await self._resolve_pomice_results(entry['url'], ctx=ctx)
+        track = self._extract_pomice_track(results)
         if track:
-            self._apply_lavalink_track_metadata(entry, track)
+            self._apply_pomice_track_metadata(entry, track)
         return track
 
     async def _complete_entry(self, state, entry):
@@ -1815,16 +1599,15 @@ class Music(commands.Cog):
             start_time = entry.get('start_time')
             if start_time:
                 elapsed = max(0, time.time() - start_time)
-        was_skipped = bool(entry and entry.get('skipped'))
-        if entry and elapsed is not None and not was_skipped:
+        if entry and elapsed is not None:
             await self._maybe_award_play_reward(entry, elapsed=elapsed)
         self._cancel_now_playing_timestamp_updates(entry)
-        requeue_front = state.loop_mode == "single" and not was_skipped
-        requeue_back = state.loop_mode == "all" and not was_skipped
+        requeue_front = state.loop_mode == "single"
+        requeue_back = state.loop_mode == "all"
         should_requeue = requeue_front or requeue_back
         reused = False
         if should_requeue:
-            if entry.get('lavalink_track') or entry.get('url'):
+            if entry.get('pomice_track') or entry.get('url'):
                 async with state.lock:
                     if requeue_front:
                         state.queue.appendleft(entry)
@@ -1841,7 +1624,7 @@ class Music(commands.Cog):
         async with state.lock:
             queue_empty = not state.queue and not state.is_playing
             loop_active = state.loop_mode != "off"
-        if queue_empty and entry and entry.get('text_channel') and not loop_active and not was_skipped:
+        if queue_empty and entry and entry.get('text_channel') and not loop_active:
             try:
                 description = self._format_queue_entry_title(entry)
                 embed = self._build_status_embed(
@@ -1853,7 +1636,7 @@ class Music(commands.Cog):
                 await entry['text_channel'].send(embed=embed)
             except (discord.HTTPException, discord.Forbidden):
                 pass
-        if queue_empty and (not loop_active or was_skipped):
+        if queue_empty and not loop_active:
             self._schedule_idle_disconnect(entry['guild'], state)
 
     async def _on_track_end(self, state, entry, error):
@@ -1867,11 +1650,9 @@ class Music(commands.Cog):
         if self.bot.user and member.id == self.bot.user.id:
             if before.channel is not None and after.channel is None:
                 state = self._get_state(member.guild)
-                shutdown_in_progress = state.manual_disconnect
                 state.manual_disconnect = True
                 self._cancel_idle_disconnect(state)
-                if not shutdown_in_progress:
-                    self._cancel_empty_voice_shutdown(state)
+                self._cancel_empty_voice_shutdown(state)
                 current_entry = state.current_entry
                 self._cancel_now_playing_timestamp_updates(current_entry)
                 async with state.lock:
@@ -1887,41 +1668,42 @@ class Music(commands.Cog):
         if not voice_client or voice_client.channel is None:
             return
         state = self._get_state(guild)
-        if not self._auto_leave_enabled(guild):
-            self._cancel_idle_disconnect(state)
-            self._cancel_empty_voice_shutdown(state)
-            return
         if not self._should_leave_voice(voice_client):
             self._cancel_idle_disconnect(state)
             self._cancel_empty_voice_shutdown(state)
             return
-        self._schedule_empty_voice_shutdown(guild, state)
+        if self._vc_is_playing(voice_client) or self._vc_is_paused(voice_client):
+            self._schedule_empty_voice_shutdown(guild, state)
+            return
+        self._schedule_idle_disconnect(guild, state)
 
     @commands.Cog.listener()
     async def on_ready(self):
-        await self.start_lavalink_nodes()
+        await self.start_pomice_nodes()
         if not self._empty_vc_watchdog.is_running():
             self._empty_vc_watchdog.start()
 
-    @tasks.loop(seconds=10)
+    @tasks.loop(minutes=1)
     async def _empty_vc_watchdog(self):
         for guild in self.bot.guilds:
-            if not self._auto_leave_enabled(guild):
-                continue
             voice_client = guild.voice_client
             if not voice_client or not voice_client.channel:
                 continue
             if not self._should_leave_voice(voice_client):
                 continue
             state = self._get_state(guild)
-            if not state.empty_voice_task or state.empty_voice_task.done():
-                self._schedule_empty_voice_shutdown(guild, state)
+            if self._vc_is_playing(voice_client) or self._vc_is_paused(voice_client):
+                if not state.empty_voice_task or state.empty_voice_task.done():
+                    self._schedule_empty_voice_shutdown(guild, state)
+                continue
+            try:
+                await voice_client.disconnect()
+            except (discord.HTTPException, discord.Forbidden):
+                pass
 
     @commands.Cog.listener()
     async def on_pomice_track_end(self, player, track, reason):
-        if not self._should_use_lavalink():
-            return
-        if player is None:
+        if not self._should_use_pomice():
             return
         guild = player.guild
         state = self._get_state(guild)
@@ -1941,7 +1723,7 @@ class Music(commands.Cog):
             None if elapsed is None else round(elapsed, 2),
             getattr(reason, "name", str(reason)),
         )
-        current_track = entry.get("lavalink_track")
+        current_track = entry.get("pomice_track")
         if current_track and track:
             current_id = getattr(current_track, "identifier", None)
             ended_id = getattr(track, "identifier", None)

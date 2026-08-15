@@ -1,6 +1,5 @@
 discord.py
 python-dotenv
 PyNaCl
-pomice>=2.11.0,<3
+pomice>=2.10.0
 pillow
-curl-cffi>=0.7,<1
