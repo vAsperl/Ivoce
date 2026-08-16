@@ -154,6 +154,15 @@ class TransportControls(discord.ui.View):
         if listener_count <= 1:
             if requester and interaction.user.id != requester.id:
                 entry['force_reward'] = True
+            entry['skipped'] = True
+            outcome = self.music_cog._build_skip_vote_embed(
+                1,
+                1,
+                status="passed",
+                entry=entry,
+                voter_mentions=[interaction.user.mention],
+            )
+            await interaction.channel.send(embed=outcome)
             try:
                 await self.music_cog._stop_voice_client(vc)
             except Exception:
@@ -178,6 +187,9 @@ class TransportControls(discord.ui.View):
             force_skip_cost=force_skip_cost,
             listener_count=listener_count,
             entry=entry,
+            voter_mentions=self.music_cog._skip_voter_mentions(
+                interaction.guild, state.skip_votes
+            ),
         )
         view = self.music_cog._build_skip_vote_view(state, force_skip_cost)
         await self.music_cog._set_skip_vote_message(state, interaction, embed, view=view)
@@ -192,8 +204,12 @@ class TransportControls(discord.ui.View):
                 force_skip_cost=force_skip_cost,
                 listener_count=listener_count,
                 entry=entry,
+                voter_mentions=self.music_cog._skip_voter_mentions(
+                    interaction.guild, state.skip_votes
+                ),
             )
             await self.music_cog._set_skip_vote_message(state, interaction, outcome, view=view)
+            entry['skipped'] = True
             try:
                 await self.music_cog._stop_voice_client(vc)
             except Exception:
@@ -304,6 +320,15 @@ class SkipVoteView(discord.ui.View):
         requester = entry.get('requester')
         if requester and interaction.user.id != requester.id:
             entry['force_reward'] = True
+        entry['skipped'] = True
+        outcome = self.music_cog._build_skip_vote_embed(
+            1,
+            1,
+            status="passed",
+            entry=entry,
+            voter_mentions=[interaction.user.mention],
+        )
+        await self.music_cog._set_skip_vote_message(state, interaction, outcome)
         try:
             await self.music_cog._stop_voice_client(vc)
         except Exception:
@@ -566,11 +591,27 @@ class Music(commands.Cog):
         user_multiplier = max(1, listener_count - 1)
         return self.force_skip_base_cost * multiplier * user_multiplier
 
-    def _build_skip_vote_embed(self, votes, required, status=None, force_skip_cost=None, listener_count=None, entry=None):
+    def _skip_voter_mentions(self, guild, voter_ids):
+        mentions = []
+        for voter_id in voter_ids:
+            member = guild.get_member(voter_id) if guild else None
+            mentions.append(member.mention if member else f"<@{voter_id}>")
+        return mentions
+
+    def _build_skip_vote_embed(
+        self,
+        votes,
+        required,
+        status=None,
+        force_skip_cost=None,
+        listener_count=None,
+        entry=None,
+        voter_mentions=None,
+    ):
         if status == "passed":
-            title = "Skip Vote Passed"
+            title = "Track Skipped"
             color = discord.Color.green()
-            description = "Majority reached. Skipping the track."
+            description = self._format_queue_entry_title(entry) if entry else "Unknown track"
         elif status == "failed":
             title = "Skip Vote Failed"
             color = discord.Color.red()
@@ -582,6 +623,12 @@ class Music(commands.Cog):
         embed = discord.Embed(title=title, description=description, color=color)
         embed.add_field(name="Votes", value=f"{votes}/{required}", inline=True)
         embed.add_field(name="Needed", value="More than half", inline=True)
+        if voter_mentions:
+            embed.add_field(
+                name="Skipped by" if status == "passed" else "Voted to skip",
+                value="\n".join(voter_mentions),
+                inline=False,
+            )
         if entry:
             thumbnail = (entry.get('metadata') or {}).get('thumbnail')
             if thumbnail:
@@ -1265,7 +1312,7 @@ class Music(commands.Cog):
         )
         await ctx.send(embed=embed)
 
-    @commands.command(name="queue")
+    @commands.command(name="queue", aliases=["q"])
     async def queue_list(self, ctx):
         """List the currently playing track plus upcoming songs."""
         state = self._get_state(ctx.guild)
@@ -1274,6 +1321,125 @@ class Music(commands.Cog):
         if state and len(state.queue) > 10:
             view = QueueView(self, state, page=1)
         await ctx.send(embed=embed, view=view)
+
+    @commands.command(name="loop")
+    async def loop_command(self, ctx, mode: str = None):
+        """Set the loop mode, or cycle it when no mode is provided."""
+        state = self._get_state(ctx.guild)
+        modes = ("off", "single", "all")
+        mode_aliases = {
+            "track": "single",
+            "song": "single",
+            "queue": "all",
+        }
+
+        if mode is None:
+            current = state.loop_mode if state.loop_mode in modes else "off"
+            mode = modes[(modes.index(current) + 1) % len(modes)]
+        else:
+            mode = mode_aliases.get(mode.lower(), mode.lower())
+            if mode not in modes:
+                prefix = ctx.prefix or "?"
+                embed = self._build_usage_embed(
+                    f"{prefix}loop [off|single|all]",
+                    f"{prefix}loop single",
+                )
+                await ctx.send(embed=embed)
+                return
+
+        state.loop_mode = mode
+        if state.current_entry:
+            await self._refresh_now_playing_embed(state.current_entry, state)
+
+        descriptions = {
+            "off": "Looping is disabled.",
+            "single": "The current track will repeat.",
+            "all": "The full queue will repeat.",
+        }
+        embed = self._build_status_embed(
+            f"Loop: {mode.capitalize()}",
+            descriptions[mode],
+            color=discord.Color.blurple(),
+            footer="Modes: Off • Single • All",
+        )
+        await ctx.send(embed=embed)
+
+    @commands.command(name="skip", aliases=["s"])
+    async def skip_command(self, ctx):
+        """Vote to skip the current track."""
+        voice_client = ctx.guild.voice_client if ctx.guild else None
+        if not voice_client or not (
+            self._vc_is_playing(voice_client) or self._vc_is_paused(voice_client)
+        ):
+            await ctx.send("Nothing is playing to skip.")
+            return
+
+        state = self._get_state(ctx.guild)
+        entry = state.current_entry if state else None
+        if not entry:
+            await ctx.send("Nothing is playing to skip.")
+            return
+
+        requester = entry.get('requester')
+        listener_count = self._voice_listener_count(voice_client)
+        if listener_count <= 1:
+            if requester and ctx.author.id != requester.id:
+                entry['force_reward'] = True
+            entry['skipped'] = True
+            outcome = self._build_skip_vote_embed(
+                1,
+                1,
+                status="passed",
+                entry=entry,
+                voter_mentions=[ctx.author.mention],
+            )
+            await ctx.send(embed=outcome)
+            try:
+                await self._stop_voice_client(voice_client)
+            except Exception:
+                pass
+            await self._reset_skip_vote(state)
+            return
+
+        async with state.lock:
+            if ctx.author.id in state.skip_votes:
+                await ctx.send("You already voted to skip.")
+                return
+            state.skip_votes.add(ctx.author.id)
+            votes = len(state.skip_votes)
+            required = self._skip_votes_required(listener_count)
+
+        force_skip_cost = self._force_skip_cost(state, listener_count)
+        embed = self._build_skip_vote_embed(
+            votes,
+            required,
+            force_skip_cost=force_skip_cost,
+            listener_count=listener_count,
+            entry=entry,
+            voter_mentions=self._skip_voter_mentions(ctx.guild, state.skip_votes),
+        )
+        view = self._build_skip_vote_view(state, force_skip_cost)
+        await self._set_skip_vote_message(state, ctx, embed, view=view)
+
+        if votes >= required:
+            if requester and any(voter_id != requester.id for voter_id in state.skip_votes):
+                entry['force_reward'] = True
+            outcome = self._build_skip_vote_embed(
+                votes,
+                required,
+                status="passed",
+                force_skip_cost=force_skip_cost,
+                listener_count=listener_count,
+                entry=entry,
+                voter_mentions=self._skip_voter_mentions(ctx.guild, state.skip_votes),
+            )
+            await self._set_skip_vote_message(state, ctx, outcome, view=view)
+            entry['skipped'] = True
+            try:
+                await self._stop_voice_client(voice_client)
+            except Exception:
+                pass
+            await self._reset_skip_vote(state)
 
     @commands.command(name="remove")
     async def remove_from_queue(self, ctx, pos: int):
@@ -1602,7 +1768,7 @@ class Music(commands.Cog):
         self._cancel_now_playing_timestamp_updates(entry)
         requeue_front = state.loop_mode == "single"
         requeue_back = state.loop_mode == "all"
-        should_requeue = requeue_front or requeue_back
+        should_requeue = (requeue_front or requeue_back) and not entry.get('skipped')
         reused = False
         if should_requeue:
             if entry.get('pomice_track') or entry.get('url'):
@@ -1622,7 +1788,13 @@ class Music(commands.Cog):
         async with state.lock:
             queue_empty = not state.queue and not state.is_playing
             loop_active = state.loop_mode != "off"
-        if queue_empty and entry and entry.get('text_channel') and not loop_active:
+        if (
+            queue_empty
+            and entry
+            and entry.get('text_channel')
+            and not loop_active
+            and not entry.get('skipped')
+        ):
             try:
                 description = self._format_queue_entry_title(entry)
                 embed = self._build_status_embed(
@@ -1700,6 +1872,31 @@ class Music(commands.Cog):
                 pass
 
     @commands.Cog.listener()
+    async def on_pomice_track_exception(self, player, track, exception):
+        guild = getattr(player, "guild", None)
+        state = self._get_state(guild)
+        entry = state.current_entry if state else None
+        if isinstance(exception, dict):
+            details = (
+                exception.get("cause")
+                or exception.get("message")
+                or exception.get("causeStackTrace")
+                or str(exception)
+            )
+            severity = exception.get("severity")
+        else:
+            details = getattr(exception, "cause", None) or getattr(exception, "message", None) or str(exception)
+            severity = getattr(exception, "severity", None)
+        if entry:
+            entry['_track_exception_logged'] = True
+        self.logger.error(
+            "Lavalink track exception\nTitle: %s\nSeverity: %s\nCause: %s",
+            getattr(track, "title", None),
+            severity,
+            details,
+        )
+
+    @commands.Cog.listener()
     async def on_pomice_track_end(self, player, track, reason):
         if not self._should_use_pomice():
             return
@@ -1732,6 +1929,8 @@ class Music(commands.Cog):
             return
         if reason_name in {"STOPPED", "CLEANUP"} and state.manual_disconnect:
             return
+        if reason_name == "LOADFAILED" and not entry.pop('_track_exception_logged', False):
+            self.logger.error("Lavalink failed to load track: %s", title)
         await self._complete_entry(state, entry)
 
 

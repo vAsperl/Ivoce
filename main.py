@@ -17,6 +17,12 @@ DEFAULT_LAVALINK_DOWNLOAD_URL = (
     "https://github.com/lavalink-devs/Lavalink/releases/latest/download/Lavalink.jar"
 )
 
+
+class _BelowErrorFilter(logging.Filter):
+    def filter(self, record):
+        return record.levelno < logging.ERROR
+
+
 def _env_flag(name, default=False):
     raw = os.getenv(name)
     if raw is None:
@@ -91,6 +97,7 @@ async def main():
             pass
 
     lavalink_proc = None
+    lavalink_log = None
     try:
         with open(LOCK_FILE, "w") as f:
             f.write(str(os.getpid()))
@@ -108,9 +115,10 @@ async def main():
             java_exec = shutil.which("java")
             if java_exec and lavalink_available:
                 try:
+                    lavalink_log = open("lavalink.log", "w", encoding="utf-8")
                     lavalink_proc = subprocess.Popen(
                         [java_exec, "-jar", lavalink_jar],
-                        stdout=subprocess.DEVNULL,
+                        stdout=lavalink_log,
                         stderr=subprocess.STDOUT,
                     )
                     print("Lavalink process started alongside the bot.")
@@ -160,6 +168,17 @@ async def main():
                     print(f'Failed to load {filename}: {e}')
 
         discord.utils.setup_logging(handler=handler, level=logging.DEBUG)
+        handler.addFilter(_BelowErrorFilter())
+
+        error_handler = logging.FileHandler(
+            filename='error.log',
+            encoding='utf-8',
+            mode='w',
+        )
+        error_handler.setLevel(logging.ERROR)
+        if handler.formatter:
+            error_handler.setFormatter(handler.formatter)
+        logging.getLogger().addHandler(error_handler)
         await bot.start(token)
     finally:
         if os.path.exists(LOCK_FILE):
@@ -170,6 +189,8 @@ async def main():
                 lavalink_proc.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 lavalink_proc.kill()
+        if lavalink_log:
+            lavalink_log.close()
 
 if __name__ == '__main__':
     asyncio.run(main())
