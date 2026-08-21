@@ -1325,23 +1325,51 @@ class Music(commands.Cog):
         }
         entries = []
         results = None
-        if backend_mode == "lavalink":
-            results = await self._resolve_pomice_results(url, ctx)
-        playlist = results if pomice and isinstance(results, pomice.Playlist) else None
-        if playlist and getattr(playlist, "tracks", None):
-            entries = [self._build_entry_from_track(base_entry, track) for track in playlist.tracks]
+        playlist = None
+        playlist_name = None
+        is_playlist_request = False
+        if backend_mode == "yt-dlp":
+            try:
+                playlist_name, flat_entries, is_playlist_request = await asyncio.to_thread(
+                    self._extract_ytdlp_playlist, url
+                )
+            except Exception as exc:
+                self.logger.warning("yt-dlp playlist lookup failed: %s", exc)
+                await ctx.send(f"Unable to load that track or playlist: {exc}")
+                return
+            for item in flat_entries:
+                entry = dict(base_entry)
+                entry['url'] = item['url']
+                entry['title'] = item.get('title')
+                entry['metadata'] = {
+                    'title': item.get('title'),
+                    'webpage_url': item['url'],
+                    'url': item['url'],
+                    'duration': item.get('duration'),
+                    'uploader': item.get('uploader'),
+                    'thumbnail': item.get('thumbnail'),
+                    'id': item.get('id'),
+                }
+                entries.append(entry)
         else:
-            entry = dict(base_entry)
-            pomice_track = None
-            if results is not None:
-                pomice_track = self._extract_pomice_track(results)
-            elif backend_mode == "lavalink":
-                pomice_track = await self._resolve_pomice_track(entry, ctx)
-            if pomice_track:
-                entry['pomice_track'] = pomice_track
-                if not entry.get('metadata'):
-                    self._apply_pomice_track_metadata(entry, pomice_track)
-            entries = [entry]
+            results = await self._resolve_pomice_results(url, ctx)
+            playlist = results if pomice and isinstance(results, pomice.Playlist) else None
+            is_playlist_request = bool(playlist and getattr(playlist, "tracks", None))
+            if is_playlist_request:
+                playlist_name = getattr(playlist, "name", None) or getattr(playlist, "title", None)
+                entries = [self._build_entry_from_track(base_entry, track) for track in playlist.tracks]
+            else:
+                entry = dict(base_entry)
+                pomice_track = None
+                if results is not None:
+                    pomice_track = self._extract_pomice_track(results)
+                else:
+                    pomice_track = await self._resolve_pomice_track(entry, ctx)
+                if pomice_track:
+                    entry['pomice_track'] = pomice_track
+                    if not entry.get('metadata'):
+                        self._apply_pomice_track_metadata(entry, pomice_track)
+                entries = [entry]
 
         state = self._get_state(ctx.guild)
         state.manual_disconnect = False
@@ -1353,8 +1381,7 @@ class Music(commands.Cog):
                 state.queue.append(entry)
 
         first_entry = entries[0]
-        if playlist and entries:
-            playlist_name = getattr(playlist, "name", None) or getattr(playlist, "title", None)
+        if is_playlist_request and entries:
             if not should_ack_queue:
                 description = (
                     f"{playlist_name or 'Playlist'}\n"
@@ -1809,6 +1836,53 @@ class Music(commands.Cog):
             raise RuntimeError("yt-dlp could not find a playable audio stream.")
         return info
 
+    def _extract_ytdlp_playlist(self, query):
+        """Return lightweight queue entries without resolving every audio URL."""
+        if not yt_dlp:
+            raise RuntimeError("yt-dlp is not installed.")
+        is_search = not query.startswith(("http://", "https://"))
+        if is_search:
+            query = f"ytsearch1:{query}"
+        options = {
+            "extract_flat": "in_playlist",
+            "quiet": True,
+            "no_warnings": True,
+            "skip_download": True,
+        }
+        with yt_dlp.YoutubeDL(options) as downloader:
+            info = downloader.extract_info(query, download=False)
+
+        raw_entries = info.get("entries") if isinstance(info, dict) else None
+        is_playlist = bool(
+            not is_search
+            and raw_entries is not None
+            and info.get("_type") == "playlist"
+        )
+        items = raw_entries if raw_entries is not None else [info]
+        entries = []
+        for item in items or []:
+            if not isinstance(item, dict):
+                continue
+            item_url = item.get("webpage_url") or item.get("original_url") or item.get("url")
+            if not item_url:
+                continue
+            # Flat YouTube playlist entries can expose only the video ID.
+            if not item_url.startswith(("http://", "https://")):
+                extractor = str(item.get("extractor_key") or item.get("ie_key") or "").lower()
+                if "youtube" in extractor or len(item_url) == 11:
+                    item_url = f"https://www.youtube.com/watch?v={item_url}"
+            entries.append({
+                "url": item_url,
+                "title": item.get("title"),
+                "duration": item.get("duration"),
+                "uploader": item.get("uploader") or item.get("channel"),
+                "thumbnail": item.get("thumbnail"),
+                "id": item.get("id"),
+            })
+        if not entries:
+            raise RuntimeError("yt-dlp could not find any playable tracks.")
+        return info.get("title") if is_playlist else None, entries, is_playlist
+
     async def _play_entry_with_ytdlp(self, entry, state, guild, voice_channel, text_channel):
         standalone = bool(entry.get('standalone_ytdlp'))
         await self._update_fallback_status(
@@ -1851,12 +1925,17 @@ class Music(commands.Cog):
 
         ffmpeg_stderr = tempfile.TemporaryFile()
         entry['ffmpeg_stderr'] = ffmpeg_stderr
-        source = discord.FFmpegPCMAudio(
+        # Have FFmpeg encode Opus itself. FFmpegOpusAudio reports an Opus
+        # source to discord.py, so VoiceClient does not try to load the host's
+        # optional libopus encoder (which is often absent on fresh servers).
+        source = discord.FFmpegOpusAudio(
             info['url'],
             executable=self.ffmpeg_executable,
             stderr=ffmpeg_stderr,
             before_options=before_options,
             options="-vn",
+            codec="libopus",
+            bitrate=128,
         )
         loop = asyncio.get_running_loop()
 
