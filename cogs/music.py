@@ -1939,8 +1939,18 @@ class Music(commands.Cog):
             raise RuntimeError("yt-dlp is not installed.")
         if not query.startswith(("http://", "https://")):
             query = f"ytsearch1:{query}"
+        is_soundcloud = "soundcloud.com" in query.lower()
         options = {
-            "format": "bestaudio/best",
+            # Some SoundCloud progressive URLs terminate almost immediately
+            # even though yt-dlp reports the full track duration. Prefer its
+            # HLS rendition there; retain the normal best-audio selection for
+            # YouTube and other extractors.
+            "format": (
+                "bestaudio[protocol=m3u8_native]/bestaudio[protocol=m3u8]/"
+                "bestaudio[protocol^=http]/bestaudio/best"
+                if is_soundcloud
+                else "bestaudio/best"
+            ),
             "noplaylist": True,
             "quiet": True,
             "no_warnings": True,
@@ -2044,22 +2054,26 @@ class Music(commands.Cog):
 
         ffmpeg_stderr = tempfile.TemporaryFile()
         entry['ffmpeg_stderr'] = ffmpeg_stderr
-        # Have FFmpeg encode Opus itself. FFmpegOpusAudio reports an Opus
-        # source to discord.py, so VoiceClient does not try to load the host's
-        # optional libopus encoder (which is often absent on fresh servers).
+        # Have FFmpeg encode Opus itself. Do not pass codec="libopus" here:
+        # FFmpegOpusAudio treats that value as an input-codec hint and switches
+        # to stream copy. SoundCloud HLS may be MP3/AAC, which cannot be copied
+        # into an Opus container and fails with "Unsupported codec id".
         source = discord.FFmpegOpusAudio(
             info['url'],
             executable=self.ffmpeg_executable,
             stderr=ffmpeg_stderr,
             before_options=before_options,
             options="-vn",
-            codec="libopus",
             bitrate=128,
         )
         loop = asyncio.get_running_loop()
+        startup_finished = asyncio.Event()
+        startup_error = None
+        entry.pop('_ffmpeg_start_confirmed', None)
 
         def after_playback(error):
             async def finish():
+                nonlocal startup_error
                 playback_error = error
                 stderr_text = ""
                 stderr_handle = entry.pop('ffmpeg_stderr', None)
@@ -2076,15 +2090,33 @@ class Music(commands.Cog):
                     playback_error = RuntimeError(
                         f"{playback_error}\nffmpeg stderr:\n{stderr_text[-3500:]}"
                     )
+                elif not entry.get('_ffmpeg_start_confirmed'):
+                    detail = (
+                        f"\nffmpeg stderr:\n{stderr_text[-3500:]}"
+                        if stderr_text
+                        else ""
+                    )
+                    playback_error = RuntimeError(
+                        f"ffmpeg exited during audio startup.{detail}"
+                    )
                 if playback_error:
                     error_text = str(playback_error).strip() or type(playback_error).__name__
                     entry['ffmpeg_failure_text'] = error_text
+                    startup_error = error_text
+                    startup_finished.set()
                     await self._update_fallback_status(
                         entry,
                         "Fallback failed",
                         error_text[-4000:],
                         discord.Color.red(),
                     )
+                else:
+                    startup_finished.set()
+                # A process which exits during the startup probe is handled by
+                # _play_entry_with_ytdlp's caller.  Calling _on_track_end here
+                # as well would complete the same queue entry twice.
+                if not entry.get('_ffmpeg_start_confirmed'):
+                    return
                 if state.current_entry is entry:
                     await self._on_track_end(state, entry, playback_error)
 
@@ -2098,12 +2130,30 @@ class Music(commands.Cog):
         )
         voice_client.play(source, after=after_playback)
         entry['start_time'] = time.time()
-        await asyncio.sleep(1)
-        if not voice_client.is_playing() and not voice_client.is_paused():
-            failure_text = entry.pop('ffmpeg_failure_text', None)
+        try:
+            await asyncio.wait_for(startup_finished.wait(), timeout=1)
+        except asyncio.TimeoutError:
+            pass
+        stopped_during_startup = (
+            not voice_client.is_playing() and not voice_client.is_paused()
+        )
+        if stopped_during_startup and not startup_finished.is_set():
+            # AudioPlayer invokes `after` from its worker thread. On Windows it
+            # can take a little longer than the initial playback probe to reap
+            # FFmpeg and schedule that callback on this loop.
+            try:
+                await asyncio.wait_for(startup_finished.wait(), timeout=4)
+            except asyncio.TimeoutError:
+                pass
+        if startup_finished.is_set() or stopped_during_startup:
+            # The callback reads and closes stderr before setting the event, so
+            # startup failures now include FFmpeg's actual diagnostic instead
+            # of the generic race-condition message.
+            failure_text = entry.pop('ffmpeg_failure_text', None) or startup_error
             raise RuntimeError(
                 failure_text or "ffmpeg stopped before fallback playback could begin."
             )
+        entry['_ffmpeg_start_confirmed'] = True
         await self._delete_loading_message(entry)
         embed = self._build_now_playing_embed(entry, len(state.queue), state.loop_mode)
         view = TransportControls(self, state)
