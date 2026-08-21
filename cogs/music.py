@@ -292,7 +292,9 @@ class SkipVoteView(discord.ui.View):
         self._set_cost_label(cost)
 
     def _set_cost_label(self, cost):
-        self.force_skip_button.label = f"💸 Force Skip (RM {cost})"
+        self.force_skip_button.label = (
+            f"💸 Force Skip (RM {cost})" if cost > 0 else "⏭️ Force Skip (Free)"
+        )
 
     def _voice_client(self, interaction):
         if interaction.guild is None:
@@ -318,15 +320,16 @@ class SkipVoteView(discord.ui.View):
             return
         listener_count = self.music_cog._voice_listener_count(vc)
         cost = self.music_cog._force_skip_cost(state, listener_count)
-        currency = self.music_cog._get_currency_manager()
-        balance = currency.get_balance(interaction.user.id)
-        if balance < cost:
-            await self._reply(
-                interaction,
-                f"You need RM {cost} to force skip. Balance: RM {balance}.",
-            )
-            return
-        currency.adjust(interaction.user.id, -cost)
+        if cost > 0:
+            currency = self.music_cog._get_currency_manager()
+            balance = currency.get_balance(interaction.user.id)
+            if balance < cost:
+                await self._reply(
+                    interaction,
+                    f"You need RM {cost} to force skip. Balance: RM {balance}.",
+                )
+                return
+            currency.adjust(interaction.user.id, -cost)
         if state:
             async with state.lock:
                 state.force_skip_uses += 1
@@ -348,7 +351,8 @@ class SkipVoteView(discord.ui.View):
             pass
         if state:
             await self.music_cog._reset_skip_vote(state)
-        await self._reply(interaction, f"Force skip used. RM {cost} charged.")
+        reply = f"Force skip used. RM {cost} charged." if cost > 0 else "Force skip used for free."
+        await self._reply(interaction, reply)
 
 
 class QueueView(discord.ui.View):
@@ -390,7 +394,8 @@ class QueueView(discord.ui.View):
 
 
 class GuildPlaybackState:
-    def __init__(self):
+    def __init__(self, guild_id=None):
+        self.guild_id = guild_id
         self.queue = deque()
         self.lock = asyncio.Lock()
         self.is_playing = False
@@ -437,9 +442,9 @@ class MusicBackendSelector(discord.ui.View):
                 "This selector belongs to another server.", ephemeral=True
             )
             return
-        if not interaction.user.guild_permissions.administrator:
+        if not self.music_cog._can_manage_music(interaction.user):
             await interaction.response.send_message(
-                "Only server administrators can change the music mode.", ephemeral=True
+                "You don't have access to change the music mode.", ephemeral=True
             )
             return
 
@@ -466,6 +471,7 @@ def _env_flag(name, default=False):
 
 
 class Music(commands.Cog):
+    OWNER_USER_ID = 255365914898333707
     IDLE_DISCONNECT_DELAY = 15
     EMPTY_VC_SHUTDOWN_DELAY = 30
 
@@ -498,6 +504,54 @@ class Music(commands.Cog):
             "data/music_backend_modes.json",
         )
         self.music_backend_modes = self._load_music_backend_modes()
+        self.music_economy_modes_path = _env_str(
+            "MUSIC_ECONOMY_MODES_FILE",
+            "data/music_economy_modes.json",
+        )
+        self.music_economy_modes = self._load_music_economy_modes()
+
+    def _can_manage_music(self, member):
+        return bool(
+            member
+            and (
+                member.id == self.OWNER_USER_ID
+                or getattr(getattr(member, "guild_permissions", None), "administrator", False)
+            )
+        )
+
+    def _load_music_economy_modes(self):
+        path = self.music_economy_modes_path
+        if not path or not os.path.exists(path):
+            return {}
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+        except (json.JSONDecodeError, OSError):
+            return {}
+        if not isinstance(data, dict):
+            return {}
+        return {str(guild_id): bool(enabled) for guild_id, enabled in data.items()}
+
+    def _save_music_economy_modes(self):
+        path = self.music_economy_modes_path
+        if not path:
+            return
+        try:
+            dir_path = os.path.dirname(path)
+            if dir_path:
+                os.makedirs(dir_path, exist_ok=True)
+            with open(path, "w", encoding="utf-8") as fh:
+                json.dump(self.music_economy_modes, fh, indent=2, sort_keys=True)
+        except OSError as exc:
+            self.logger.warning("Unable to save music economy modes: %s", exc)
+
+    def _is_music_economy_enabled(self, guild_or_id):
+        guild_id = getattr(guild_or_id, "id", guild_or_id)
+        return self.music_economy_modes.get(str(guild_id), True)
+
+    def _set_music_economy_enabled(self, guild_id, enabled):
+        self.music_economy_modes[str(guild_id)] = bool(enabled)
+        self._save_music_economy_modes()
 
     def _load_music_backend_modes(self):
         path = self.music_backend_modes_path
@@ -714,7 +768,7 @@ class Music(commands.Cog):
             return None
         state = self.guild_states.get(guild.id)
         if state is None:
-            state = GuildPlaybackState()
+            state = GuildPlaybackState(guild.id)
             self.guild_states[guild.id] = state
         return state
 
@@ -734,6 +788,8 @@ class Music(commands.Cog):
         return max(1, (listener_count // 2) + 1)
 
     def _force_skip_cost(self, state, listener_count):
+        if not self._is_music_economy_enabled(getattr(state, "guild_id", None)):
+            return 0
         skip_uses = getattr(state, "force_skip_uses", 0)
         multiplier = 2 ** skip_uses
         user_multiplier = max(1, listener_count - 1)
@@ -1424,21 +1480,84 @@ class Music(commands.Cog):
 
     @commands.command(name="musicmode", aliases=["musicbackend"])
     @commands.guild_only()
-    @commands.has_permissions(administrator=True)
     async def music_mode(self, ctx):
         """Choose Lavalink-with-fallback or standalone yt-dlp playback."""
+        if not self._can_manage_music(ctx.author):
+            embed = self._build_status_embed(
+                "Access denied",
+                "You don't have access to this command.",
+                color=discord.Color.red(),
+                footer="Admin music settings",
+            )
+            await ctx.send(embed=embed)
+            return
         mode = self._get_music_backend_mode(ctx.guild)
         embed = self._build_music_mode_embed(mode)
         view = MusicBackendSelector(self, ctx.guild.id, mode)
         await ctx.send(embed=embed, view=view)
 
+    @commands.command(name="musiceconomy", aliases=["musicmoney"])
+    @commands.guild_only()
+    async def music_economy(self, ctx, setting: str = None):
+        """Toggle music charges and rewards for this server."""
+        if not self._can_manage_music(ctx.author):
+            embed = self._build_status_embed(
+                "Access denied",
+                "You don't have access to this command.",
+                color=discord.Color.red(),
+                footer="Admin music settings",
+            )
+            await ctx.send(embed=embed)
+            return
+
+        currently_enabled = self._is_music_economy_enabled(ctx.guild)
+        if setting is None or setting.lower() == "toggle":
+            enabled = not currently_enabled
+        elif setting.lower() in {"on", "enable", "enabled"}:
+            enabled = True
+        elif setting.lower() in {"off", "disable", "disabled", "free"}:
+            enabled = False
+        elif setting.lower() in {"status", "show"}:
+            enabled = currently_enabled
+        else:
+            prefix = ctx.prefix or "?"
+            await ctx.send(f"Usage: `{prefix}musiceconomy [on|off|status]`")
+            return
+
+        if setting is None or setting.lower() not in {"status", "show"}:
+            self._set_music_economy_enabled(ctx.guild.id, enabled)
+
+        if enabled:
+            description = (
+                "Music economy is enabled. Force Skip can charge RM and "
+                "eligible completed tracks can award RM."
+            )
+            title = "Music economy: On"
+        else:
+            description = (
+                "Music is free. Force Skip does not charge RM and music "
+                "playback does not award RM."
+            )
+            title = "Music economy: Off"
+        embed = self._build_status_embed(
+            title,
+            description,
+            color=discord.Color.blurple(),
+            footer="Admin music settings",
+        )
+        await ctx.send(embed=embed)
+
     @music_mode.error
     async def music_mode_error(self, ctx, error):
-        if isinstance(error, commands.MissingPermissions):
-            await ctx.send("Only server administrators can change the music mode.")
-            return
         if isinstance(error, commands.NoPrivateMessage):
             await ctx.send("Music mode can only be changed inside a server.")
+            return
+        raise error
+
+    @music_economy.error
+    async def music_economy_error(self, ctx, error):
+        if isinstance(error, commands.NoPrivateMessage):
+            await ctx.send("Music economy can only be changed inside a server.")
             return
         raise error
 
@@ -2191,6 +2310,9 @@ class Music(commands.Cog):
         return CurrencyManager(os.getenv("GAMES_DATAFILE", "games_currency.json"), start_balance=100)
 
     async def _maybe_award_play_reward(self, entry, elapsed=None):
+        if not self._is_music_economy_enabled(entry.get("guild")):
+            entry.pop('force_reward', None)
+            return
         if self.play_reward <= 0:
             return
         if self.disable_loop_rewards and entry.get("state") and entry["state"].loop_mode != "off":
