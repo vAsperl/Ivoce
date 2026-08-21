@@ -1,5 +1,6 @@
-discord.py
+discord.py[voice]
 python-dotenv
-PyNaCl
 pomice>=2.10.0
+yt-dlp
+imageio-ffmpeg
 pillow

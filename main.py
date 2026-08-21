@@ -131,8 +131,10 @@ async def main():
             lavalink_host = os.getenv("LAVALINK_HOST", "127.0.0.1")
             lavalink_port = int(os.getenv("LAVALINK_PORT", "2333"))
             if not _wait_for_lavalink(lavalink_host, lavalink_port, timeout=15):
-                print(f"Lavalink is not reachable at {lavalink_host}:{lavalink_port}. Bot will not start.")
-                return
+                print(
+                    f"Lavalink is not reachable at {lavalink_host}:{lavalink_port}. "
+                    "Continuing with the yt-dlp/ffmpeg fallback."
+                )
         else:
             print("Lavalink startup disabled via DISABLE_LAVALINK.")
 

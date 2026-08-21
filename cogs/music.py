@@ -3,6 +3,9 @@ import json
 import logging
 import os
 import random
+import shlex
+import shutil
+import tempfile
 import time
 
 import discord
@@ -16,6 +19,16 @@ try:
     import pomice
 except ModuleNotFoundError:  # pragma: no cover - optional dependency
     pomice = None
+
+try:
+    import yt_dlp
+except ModuleNotFoundError:  # pragma: no cover - optional dependency
+    yt_dlp = None
+
+try:
+    import imageio_ffmpeg
+except ModuleNotFoundError:  # pragma: no cover - optional dependency
+    imageio_ffmpeg = None
 
 from cogs.games import CurrencyManager
 
@@ -390,6 +403,52 @@ class GuildPlaybackState:
         self.skip_message = None
         self.skip_view = None
         self.force_skip_uses = 0
+        self.backend_disconnect_event = None
+
+
+class MusicBackendSelector(discord.ui.View):
+    def __init__(self, music_cog, guild_id, current_mode):
+        super().__init__(timeout=60)
+        self.music_cog = music_cog
+        self.guild_id = guild_id
+        for option in self.backend_select.options:
+            option.default = option.value == current_mode
+
+    @discord.ui.select(
+        placeholder="Choose the music playback mode",
+        options=[
+            discord.SelectOption(
+                label="Lavalink + yt-dlp fallback",
+                value="lavalink",
+                description="Use Lavalink first and yt-dlp if playback fails.",
+                emoji="🌐",
+            ),
+            discord.SelectOption(
+                label="yt-dlp only",
+                value="yt-dlp",
+                description="Bypass Lavalink and stream directly through FFmpeg.",
+                emoji="🎵",
+            ),
+        ],
+    )
+    async def backend_select(self, interaction, select):
+        if interaction.guild is None or interaction.guild.id != self.guild_id:
+            await interaction.response.send_message(
+                "This selector belongs to another server.", ephemeral=True
+            )
+            return
+        if not interaction.user.guild_permissions.administrator:
+            await interaction.response.send_message(
+                "Only server administrators can change the music mode.", ephemeral=True
+            )
+            return
+
+        mode = select.values[0]
+        self.music_cog._set_music_backend_mode(self.guild_id, mode)
+        for option in select.options:
+            option.default = option.value == mode
+        embed = self.music_cog._build_music_mode_embed(mode, changed=True)
+        await interaction.response.edit_message(embed=embed, view=self)
 
 
 def _env_int(name, default):
@@ -433,6 +492,88 @@ class Music(commands.Cog):
         self.play_reward_counts = {}
         self.disable_loop_rewards = _env_flag("DISABLE_LOOP_REWARDS", default=False)
         self.force_skip_base_cost = _env_int("MUSIC_FORCE_SKIP_BASE_COST", 100)
+        self.ffmpeg_executable = self._find_ffmpeg_executable()
+        self.music_backend_modes_path = _env_str(
+            "MUSIC_BACKEND_MODES_FILE",
+            "data/music_backend_modes.json",
+        )
+        self.music_backend_modes = self._load_music_backend_modes()
+
+    def _load_music_backend_modes(self):
+        path = self.music_backend_modes_path
+        if not path or not os.path.exists(path):
+            return {}
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+        except (json.JSONDecodeError, OSError):
+            return {}
+        if not isinstance(data, dict):
+            return {}
+        return {
+            str(guild_id): mode
+            for guild_id, mode in data.items()
+            if mode in {"lavalink", "yt-dlp"}
+        }
+
+    def _save_music_backend_modes(self):
+        path = self.music_backend_modes_path
+        if not path:
+            return
+        try:
+            dir_path = os.path.dirname(path)
+            if dir_path:
+                os.makedirs(dir_path, exist_ok=True)
+            with open(path, "w", encoding="utf-8") as fh:
+                json.dump(self.music_backend_modes, fh, indent=2, sort_keys=True)
+        except OSError as exc:
+            self.logger.warning("Unable to save music backend modes: %s", exc)
+
+    def _get_music_backend_mode(self, guild):
+        guild_id = guild.id if guild is not None else None
+        return self.music_backend_modes.get(str(guild_id), "lavalink")
+
+    def _set_music_backend_mode(self, guild_id, mode):
+        if mode not in {"lavalink", "yt-dlp"}:
+            raise ValueError(f"Unsupported music backend mode: {mode}")
+        self.music_backend_modes[str(guild_id)] = mode
+        self._save_music_backend_modes()
+
+    def _build_music_mode_embed(self, mode, changed=False):
+        if mode == "yt-dlp":
+            title = "Music mode: yt-dlp only"
+            description = (
+                "New tracks will bypass Lavalink and stream directly with "
+                "yt-dlp and FFmpeg."
+            )
+        else:
+            title = "Music mode: Lavalink + fallback"
+            description = (
+                "New tracks will use Lavalink first, with yt-dlp and FFmpeg "
+                "as the automatic fallback."
+            )
+        if changed:
+            description += "\n\nThe current track is unchanged."
+        return self._build_status_embed(
+            title,
+            description,
+            color=discord.Color.blurple(),
+            footer="Admin music settings",
+        )
+
+    def _find_ffmpeg_executable(self):
+        configured = os.getenv("FFMPEG_EXECUTABLE", "").strip()
+        if configured:
+            return configured
+        system_ffmpeg = shutil.which("ffmpeg")
+        if system_ffmpeg:
+            return system_ffmpeg
+        if imageio_ffmpeg:
+            try:
+                return imageio_ffmpeg.get_ffmpeg_exe()
+            except Exception as exc:
+                self.logger.warning("Bundled ffmpeg could not be located: %s", exc)
+        return "ffmpeg"
 
     def _load_pomice_node_specs(self):
         raw = os.getenv("POMICE_NODES", "").strip()
@@ -532,8 +673,15 @@ class Music(commands.Cog):
             }
             if spec.region:
                 kwargs["region"] = spec.region
-            await self.pomice_pool.create_node(**kwargs)
-        self._pomice_nodes_ready = True
+            try:
+                await self.pomice_pool.create_node(**kwargs)
+                self._pomice_nodes_ready = True
+            except Exception as exc:
+                self.logger.warning(
+                    "Unable to connect to Lavalink node %s: %s",
+                    spec.identifier,
+                    exc,
+                )
         self._pomice_nodes_started = True
 
     def _should_use_pomice(self):
@@ -912,6 +1060,13 @@ class Music(commands.Cog):
             value=loop_mode.capitalize(),
             inline=True
         )
+        backend = entry.get('playback_backend')
+        if backend:
+            embed.add_field(
+                name="Playback backend",
+                value=backend,
+                inline=True,
+            )
         thumbnail = metadata.get('thumbnail')
         if thumbnail:
             embed.set_thumbnail(url=thumbnail)
@@ -1136,8 +1291,8 @@ class Music(commands.Cog):
     @commands.command(aliases=["p"])
     async def play(self, ctx, *, url):
         self.logger.info(f"Play command invoked by {ctx.author} in {ctx.guild.name}")
-        if not pomice:
-            await ctx.send("Lavalink is not available. Pomice is not installed.")
+        if not pomice and not yt_dlp:
+            await ctx.send("Music playback is unavailable. Install pomice or yt-dlp.")
             return
 
         if ctx.author.voice is None:
@@ -1150,6 +1305,10 @@ class Music(commands.Cog):
 
         if not url or not url.strip():
             await ctx.send("Please provide a URL to play.")
+            return
+        backend_mode = self._get_music_backend_mode(ctx.guild)
+        if backend_mode == "yt-dlp" and not yt_dlp:
+            await ctx.send("yt-dlp mode is selected, but yt-dlp is not installed.")
             return
         await self._safe_delete_message(ctx.message)
 
@@ -1165,7 +1324,9 @@ class Music(commands.Cog):
             'state': None,
         }
         entries = []
-        results = await self._resolve_pomice_results(url, ctx)
+        results = None
+        if backend_mode == "lavalink":
+            results = await self._resolve_pomice_results(url, ctx)
         playlist = results if pomice and isinstance(results, pomice.Playlist) else None
         if playlist and getattr(playlist, "tracks", None):
             entries = [self._build_entry_from_track(base_entry, track) for track in playlist.tracks]
@@ -1174,7 +1335,7 @@ class Music(commands.Cog):
             pomice_track = None
             if results is not None:
                 pomice_track = self._extract_pomice_track(results)
-            else:
+            elif backend_mode == "lavalink":
                 pomice_track = await self._resolve_pomice_track(entry, ctx)
             if pomice_track:
                 entry['pomice_track'] = pomice_track
@@ -1233,6 +1394,26 @@ class Music(commands.Cog):
                 await ctx.send(embed=embed)
 
         await self._start_next_in_queue(state, ctx.guild)
+
+    @commands.command(name="musicmode", aliases=["musicbackend"])
+    @commands.guild_only()
+    @commands.has_permissions(administrator=True)
+    async def music_mode(self, ctx):
+        """Choose Lavalink-with-fallback or standalone yt-dlp playback."""
+        mode = self._get_music_backend_mode(ctx.guild)
+        embed = self._build_music_mode_embed(mode)
+        view = MusicBackendSelector(self, ctx.guild.id, mode)
+        await ctx.send(embed=embed, view=view)
+
+    @music_mode.error
+    async def music_mode_error(self, ctx, error):
+        if isinstance(error, commands.MissingPermissions):
+            await ctx.send("Only server administrators can change the music mode.")
+            return
+        if isinstance(error, commands.NoPrivateMessage):
+            await ctx.send("Music mode can only be changed inside a server.")
+            return
+        raise error
 
     @play.error
     async def play_error(self, ctx, error):
@@ -1557,7 +1738,24 @@ class Music(commands.Cog):
         text_channel = entry['text_channel']
 
         try:
-            await self._play_entry_with_pomice(entry, state, guild, voice_channel, text_channel)
+            if self._get_music_backend_mode(guild) == "yt-dlp":
+                entry['standalone_ytdlp'] = True
+                await self._play_entry_with_ytdlp(
+                    entry, state, guild, voice_channel, text_channel
+                )
+                return
+            try:
+                await self._play_entry_with_pomice(entry, state, guild, voice_channel, text_channel)
+            except Exception as lavalink_error:
+                self.logger.warning(
+                    "Lavalink playback failed for %s; trying yt-dlp/ffmpeg: %s",
+                    entry.get('url'),
+                    lavalink_error,
+                )
+                if not await self._switch_entry_to_fallback(
+                    state, entry, reason=str(lavalink_error)
+                ):
+                    return
         except Exception as e:
             self.logger.error(f"An error occurred while handling the queue: {e}", exc_info=True)
             await self._delete_loading_message(entry)
@@ -1566,6 +1764,240 @@ class Music(commands.Cog):
             except (discord.HTTPException, discord.Forbidden):
                 pass
             await self._complete_entry(state, entry)
+
+    async def _ensure_native_voice_connection(self, guild, voice_channel):
+        voice_client = guild.voice_client
+        if voice_client is not None and self._is_pomice_player(voice_client):
+            state = self._get_state(guild)
+            disconnect_event = asyncio.Event()
+            state.backend_disconnect_event = disconnect_event
+            try:
+                await voice_client.disconnect()
+                try:
+                    await asyncio.wait_for(disconnect_event.wait(), timeout=5)
+                except asyncio.TimeoutError:
+                    self.logger.warning(
+                        "Discord did not confirm the Lavalink voice disconnect within 5 seconds."
+                    )
+            finally:
+                state.backend_disconnect_event = None
+            voice_client = None
+        if voice_client is None:
+            voice_client = await voice_channel.connect(timeout=15, reconnect=False)
+        elif voice_client.channel != voice_channel:
+            await voice_client.move_to(voice_channel)
+        return voice_client
+
+    def _extract_ytdlp_info(self, query):
+        if not yt_dlp:
+            raise RuntimeError("yt-dlp is not installed.")
+        if not query.startswith(("http://", "https://")):
+            query = f"ytsearch1:{query}"
+        options = {
+            "format": "bestaudio/best",
+            "noplaylist": True,
+            "quiet": True,
+            "no_warnings": True,
+            "skip_download": True,
+        }
+        with yt_dlp.YoutubeDL(options) as downloader:
+            info = downloader.extract_info(query, download=False)
+        entries = info.get("entries") if isinstance(info, dict) else None
+        if entries is not None:
+            info = next((item for item in entries if item), None)
+        if not info or not info.get("url"):
+            raise RuntimeError("yt-dlp could not find a playable audio stream.")
+        return info
+
+    async def _play_entry_with_ytdlp(self, entry, state, guild, voice_channel, text_channel):
+        standalone = bool(entry.get('standalone_ytdlp'))
+        await self._update_fallback_status(
+            entry,
+            "yt-dlp: resolving track" if standalone else "Fallback: resolving track",
+            "yt-dlp is locating a playable audio stream...",
+            discord.Color.orange(),
+        )
+        info = await asyncio.to_thread(self._extract_ytdlp_info, entry['url'])
+        await self._update_fallback_status(
+            entry,
+            "yt-dlp: connecting" if standalone else "Fallback: connecting",
+            "Audio stream found. Connecting through Discord native voice...",
+            discord.Color.orange(),
+        )
+        voice_client = await self._ensure_native_voice_connection(guild, voice_channel)
+        metadata = {
+            'title': info.get('title'),
+            'webpage_url': info.get('webpage_url') or info.get('original_url') or entry['url'],
+            'url': info.get('webpage_url') or info.get('original_url') or entry['url'],
+            'duration': info.get('duration'),
+            'uploader': info.get('uploader') or info.get('channel'),
+            'thumbnail': info.get('thumbnail'),
+            'id': info.get('id'),
+        }
+        entry['metadata'] = metadata
+        entry['title'] = metadata['title'] or entry.get('title') or entry['url']
+        entry['playback_backend'] = 'yt-dlp/ffmpeg'
+
+        before_options = "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5"
+        http_headers = info.get('http_headers') or {}
+        if http_headers:
+            header_blob = "".join(
+                f"{name}: {value}\r\n"
+                for name, value in http_headers.items()
+                if value is not None and name.lower() != "accept-encoding"
+            )
+            if header_blob:
+                before_options += f" -headers {shlex.quote(header_blob)}"
+
+        ffmpeg_stderr = tempfile.TemporaryFile()
+        entry['ffmpeg_stderr'] = ffmpeg_stderr
+        source = discord.FFmpegPCMAudio(
+            info['url'],
+            executable=self.ffmpeg_executable,
+            stderr=ffmpeg_stderr,
+            before_options=before_options,
+            options="-vn",
+        )
+        loop = asyncio.get_running_loop()
+
+        def after_playback(error):
+            async def finish():
+                playback_error = error
+                stderr_text = ""
+                stderr_handle = entry.pop('ffmpeg_stderr', None)
+                if stderr_handle:
+                    try:
+                        stderr_handle.flush()
+                        stderr_handle.seek(0)
+                        stderr_text = stderr_handle.read().decode(errors='replace').strip()
+                    except (OSError, ValueError):
+                        pass
+                    finally:
+                        stderr_handle.close()
+                if playback_error and stderr_text:
+                    playback_error = RuntimeError(
+                        f"{playback_error}\nffmpeg stderr:\n{stderr_text[-3500:]}"
+                    )
+                if playback_error:
+                    error_text = str(playback_error).strip() or type(playback_error).__name__
+                    entry['ffmpeg_failure_text'] = error_text
+                    await self._update_fallback_status(
+                        entry,
+                        "Fallback failed",
+                        error_text[-4000:],
+                        discord.Color.red(),
+                    )
+                if state.current_entry is entry:
+                    await self._on_track_end(state, entry, playback_error)
+
+            asyncio.run_coroutine_threadsafe(finish(), loop)
+
+        await self._update_fallback_status(
+            entry,
+            "yt-dlp: starting ffmpeg" if standalone else "Fallback: starting ffmpeg",
+            f"Starting **{discord.utils.escape_markdown(entry['title'])}**...",
+            discord.Color.orange(),
+        )
+        voice_client.play(source, after=after_playback)
+        entry['start_time'] = time.time()
+        await asyncio.sleep(1)
+        if not voice_client.is_playing() and not voice_client.is_paused():
+            failure_text = entry.pop('ffmpeg_failure_text', None)
+            raise RuntimeError(
+                failure_text or "ffmpeg stopped before fallback playback could begin."
+            )
+        await self._delete_loading_message(entry)
+        embed = self._build_now_playing_embed(entry, len(state.queue), state.loop_mode)
+        view = TransportControls(self, state)
+        view.sync_play_pause(voice_client)
+        entry['force_embed_refresh'] = bool(entry.get('now_playing_message'))
+        await self._send_now_playing_embed(text_channel, entry, state, embed, view)
+        await self._update_fallback_status(
+            entry,
+            "yt-dlp active" if standalone else "Fallback active",
+            (
+                f"Now playing **{discord.utils.escape_markdown(entry['title'])}**\n"
+                "Source: yt-dlp • Audio: ffmpeg"
+            ),
+            discord.Color.green(),
+        )
+        self.logger.info("Playing with yt-dlp/ffmpeg: %s", entry['title'])
+
+    async def _update_fallback_status(self, entry, title, description, color):
+        text_channel = entry.get('text_channel')
+        if not text_channel:
+            return
+        embed = self._build_status_embed(
+            title,
+            description,
+            color=color,
+            footer=(
+                "Standalone yt-dlp playback"
+                if entry.get('standalone_ytdlp')
+                else "Lavalink fallback progress"
+            ),
+        )
+        message = entry.get('fallback_status_message')
+        if message:
+            try:
+                await message.edit(embed=embed)
+                return
+            except (discord.HTTPException, discord.Forbidden, discord.NotFound):
+                entry.pop('fallback_status_message', None)
+        try:
+            entry['fallback_status_message'] = await text_channel.send(embed=embed)
+        except (discord.HTTPException, discord.Forbidden):
+            pass
+
+    async def _switch_entry_to_fallback(self, state, entry, reason=None):
+        if not state or not entry or state.current_entry is not entry:
+            return False
+        if entry.get('playback_backend') == 'yt-dlp/ffmpeg':
+            return True
+        if entry.get('_fallback_attempted') or entry.get('_switching_to_fallback'):
+            return False
+
+        entry['_fallback_attempted'] = True
+        entry['_switching_to_fallback'] = True
+        if reason:
+            self.logger.warning(
+                "Switching %s to yt-dlp/ffmpeg after Lavalink failure: %s",
+                entry.get('title') or entry.get('url'),
+                reason,
+            )
+        try:
+            await self._play_entry_with_ytdlp(
+                entry,
+                state,
+                entry['guild'],
+                entry['voice_channel'],
+                entry['text_channel'],
+            )
+            return True
+        except Exception as exc:
+            stderr_handle = entry.pop('ffmpeg_stderr', None)
+            if stderr_handle:
+                try:
+                    stderr_handle.close()
+                except OSError:
+                    pass
+            error_text = str(exc).strip() or type(exc).__name__
+            self.logger.error("yt-dlp/ffmpeg fallback failed: %s", error_text, exc_info=True)
+            await self._update_fallback_status(
+                entry,
+                "Fallback failed",
+                error_text,
+                discord.Color.red(),
+            )
+            try:
+                await entry['text_channel'].send(f"Fallback playback failed: {error_text}")
+            except (discord.HTTPException, discord.Forbidden):
+                pass
+            if state.current_entry is entry:
+                await self._complete_entry(state, entry)
+            return False
+        finally:
+            entry.pop('_switching_to_fallback', None)
 
     def _is_pomice_player(self, voice_client):
         if not pomice or not self.pomice_player_cls:
@@ -1577,10 +2009,21 @@ class Music(commands.Cog):
             return None
         player = guild.voice_client
         if player is not None and not self._is_pomice_player(player):
+            state = self._get_state(guild)
+            disconnect_event = asyncio.Event()
+            state.backend_disconnect_event = disconnect_event
             try:
                 await player.disconnect()
+                try:
+                    await asyncio.wait_for(disconnect_event.wait(), timeout=5)
+                except asyncio.TimeoutError:
+                    self.logger.warning(
+                        "Discord did not confirm the native voice disconnect within 5 seconds."
+                    )
             except (discord.HTTPException, discord.Forbidden):
                 pass
+            finally:
+                state.backend_disconnect_event = None
             player = None
         if player is None:
             player = await voice_channel.connect(cls=pomice.Player)
@@ -1820,6 +2263,16 @@ class Music(commands.Cog):
         if self.bot.user and member.id == self.bot.user.id:
             if before.channel is not None and after.channel is None:
                 state = self._get_state(member.guild)
+                disconnect_event = state.backend_disconnect_event
+                if disconnect_event:
+                    if not disconnect_event.is_set():
+                        disconnect_event.set()
+                    # Switching between the native Discord voice client and
+                    # Pomice deliberately disconnects the bot. Preserve the
+                    # active entry and queue during that backend handoff.
+                    return
+                if state.current_entry and state.current_entry.get('_switching_to_fallback'):
+                    return
                 state.manual_disconnect = True
                 self._cancel_idle_disconnect(state)
                 self._cancel_empty_voice_shutdown(state)
@@ -1895,6 +2348,8 @@ class Music(commands.Cog):
             severity,
             details,
         )
+        if entry:
+            await self._switch_entry_to_fallback(state, entry, reason=details)
 
     @commands.Cog.listener()
     async def on_pomice_track_end(self, player, track, reason):
@@ -1906,6 +2361,9 @@ class Music(commands.Cog):
             return
         entry = state.current_entry
         if not entry:
+            return
+        # A delayed Lavalink end event may arrive after native playback has begun.
+        if entry.get('playback_backend') == 'yt-dlp/ffmpeg':
             return
         metadata = entry.get("metadata") or {}
         duration = metadata.get("duration")
@@ -1925,12 +2383,41 @@ class Music(commands.Cog):
             if current_id and ended_id and current_id != ended_id:
                 return
         reason_name = getattr(reason, "name", str(reason)).upper()
+        if entry.get('_switching_to_fallback', False):
+            return
         if reason_name == "REPLACED":
             return
         if reason_name in {"STOPPED", "CLEANUP"} and state.manual_disconnect:
             return
-        if reason_name == "LOADFAILED" and not entry.pop('_track_exception_logged', False):
-            self.logger.error("Lavalink failed to load track: %s", title)
+        ended_early = bool(
+            duration
+            and elapsed is not None
+            and elapsed + 2 < duration
+            and not entry.get('skipped')
+            and reason_name in {"FINISHED", "STOPPED", "CLEANUP"}
+        )
+        should_fallback = reason_name == "LOADFAILED" or ended_early
+        if should_fallback:
+            if not entry.pop('_track_exception_logged', False):
+                self.logger.error(
+                    "Lavalink playback ended unexpectedly: title=%s reason=%s "
+                    "elapsed=%s duration=%s",
+                    title,
+                    reason_name,
+                    elapsed,
+                    duration,
+                )
+            if await self._switch_entry_to_fallback(
+                state,
+                entry,
+                reason=(
+                    f"track ended with {reason_name} after "
+                    f"{0 if elapsed is None else round(elapsed, 1)}s/{duration}s"
+                ),
+            ):
+                return
+            if state.current_entry is not entry:
+                return
         await self._complete_entry(state, entry)
 
 
