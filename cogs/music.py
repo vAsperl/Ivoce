@@ -1934,23 +1934,30 @@ class Music(commands.Cog):
             await voice_client.move_to(voice_channel)
         return voice_client
 
-    def _extract_ytdlp_info(self, query):
+    def _extract_ytdlp_info(self, query, prefer_m4a=False):
         if not yt_dlp:
             raise RuntimeError("yt-dlp is not installed.")
         if not query.startswith(("http://", "https://")):
             query = f"ytsearch1:{query}"
         is_soundcloud = "soundcloud.com" in query.lower()
+        if prefer_m4a and not is_soundcloud:
+            format_selector = (
+                "bestaudio[ext=m4a]/bestaudio[acodec^=mp4a]/"
+                "bestaudio[protocol^=http][ext=m4a]/bestaudio/best"
+            )
+        else:
+            format_selector = (
+                "bestaudio[protocol=m3u8_native]/bestaudio[protocol=m3u8]/"
+                "bestaudio[protocol^=http]/bestaudio/best"
+                if is_soundcloud
+                else "bestaudio/best"
+            )
         options = {
             # Some SoundCloud progressive URLs terminate almost immediately
             # even though yt-dlp reports the full track duration. Prefer its
             # HLS rendition there; retain the normal best-audio selection for
             # YouTube and other extractors.
-            "format": (
-                "bestaudio[protocol=m3u8_native]/bestaudio[protocol=m3u8]/"
-                "bestaudio[protocol^=http]/bestaudio/best"
-                if is_soundcloud
-                else "bestaudio/best"
-            ),
+            "format": format_selector,
             "noplaylist": True,
             "quiet": True,
             "no_warnings": True,
@@ -2020,7 +2027,11 @@ class Music(commands.Cog):
             "yt-dlp is locating a playable audio stream...",
             discord.Color.orange(),
         )
-        info = await asyncio.to_thread(self._extract_ytdlp_info, entry['url'])
+        info = await asyncio.to_thread(
+            self._extract_ytdlp_info,
+            entry['url'],
+            bool(entry.get('_prefer_m4a')),
+        )
         await self._update_fallback_status(
             entry,
             "yt-dlp: connecting" if standalone else "Fallback: connecting",
@@ -2507,7 +2518,66 @@ class Music(commands.Cog):
         if error:
             self.logger.error(f"Player error: {error}", exc_info=True)
             await entry['text_channel'].send(f"Player error: {error}")
+        elif await self._retry_premature_ytdlp_end(state, entry):
+            return
         await self._complete_entry(state, entry)
+
+    async def _retry_premature_ytdlp_end(self, state, entry):
+        """Retry a suspicious clean EOF with YouTube's M4A/AAC rendition."""
+        if (
+            not entry
+            or entry.get('playback_backend') != 'yt-dlp/ffmpeg'
+            or entry.get('_prefer_m4a')
+            or entry.get('skipped')
+            or state.current_entry is not entry
+        ):
+            return False
+
+        metadata = entry.get('metadata') or {}
+        duration = metadata.get('duration')
+        start_time = entry.get('start_time')
+        if not isinstance(duration, (int, float)) or duration < 30 or not start_time:
+            return False
+
+        elapsed = max(0, time.time() - start_time)
+        early_end_limit = min(30, duration * 0.25)
+        if elapsed >= early_end_limit:
+            return False
+
+        entry['_prefer_m4a'] = True
+        self.logger.warning(
+            "Track ended after %.1fs of %.1fs; retrying with M4A/AAC: %s",
+            elapsed,
+            duration,
+            entry.get('url'),
+        )
+        await self._update_fallback_status(
+            entry,
+            "Audio stream ended early",
+            "Retrying with YouTube's M4A/AAC audio stream...",
+            discord.Color.orange(),
+        )
+        try:
+            await self._play_entry_with_ytdlp(
+                entry,
+                state,
+                entry['guild'],
+                entry['voice_channel'],
+                entry['text_channel'],
+            )
+        except Exception as exc:
+            self.logger.error(
+                "M4A/AAC retry failed for %s: %s",
+                entry.get('url'),
+                exc,
+                exc_info=True,
+            )
+            try:
+                await entry['text_channel'].send(f"Playback retry failed: {exc}")
+            except (discord.HTTPException, discord.Forbidden):
+                pass
+            return False
+        return True
 
     @commands.Cog.listener()
     async def on_voice_state_update(self, member, before, after):
